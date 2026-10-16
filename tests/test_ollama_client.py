@@ -3,8 +3,11 @@ import io
 import json
 import os
 import socket
+import time
 import unittest
 from unittest import mock
+
+import httpx
 
 import ollama_client
 from ollama_client import ChatSession, OllamaClient
@@ -22,7 +25,7 @@ class FakeServerTestCase(unittest.TestCase):
     def setUp(self):
         self.server = FakeOllama().start()
         self.addCleanup(self.server.stop)
-        self.client = OllamaClient(self.server.url, default_model="fake:1")
+        self.client = OllamaClient(self.server.url, default_model="fake:1", retry_delay=0.01)
 
 
 class TestClient(FakeServerTestCase):
@@ -97,6 +100,96 @@ class TestClient(FakeServerTestCase):
 
     def test_batch_process_empty(self):
         self.assertEqual(self.client.batch_process([]), {})
+
+
+class TestRetriesAndTimeouts(FakeServerTestCase):
+    def chat_requests(self):
+        return [r for r in self.server.requests if r[0] == "/api/chat"]
+
+    def test_transient_error_is_retried(self):
+        self.server.fail_next = 2
+        self.assertEqual(self.client.generate("hi"), "msgs=1 last=hi")
+        self.assertEqual(len(self.chat_requests()), 3)
+
+    def test_gives_up_after_retries(self):
+        self.server.fail_next = 10
+        with self.assertRaises(ollama_client.ollama.ResponseError):
+            self.client.generate("hi")
+        self.assertEqual(len(self.chat_requests()), 3)  # 1 try + 2 retries
+
+    def test_server_error_500_is_not_retried(self):
+        with self.assertRaises(ollama_client.ollama.ResponseError):
+            self.client.generate("boom")
+        self.assertEqual(len(self.chat_requests()), 1)
+
+    def test_retries_zero_disables_retrying(self):
+        client = OllamaClient(self.server.url, retries=0)
+        self.server.fail_next = 1
+        with self.assertRaises(ollama_client.ollama.ResponseError):
+            client.generate("hi", model="fake:1")
+        self.assertEqual(len(self.chat_requests()), 1)
+
+    def test_system_message_is_retried(self):
+        self.server.fail_next = 1
+        self.assertEqual(self.client.system_message("rules", "hi"), "msgs=2 last=hi")
+
+    def test_streaming_is_not_retried(self):
+        self.server.fail_next = 1
+        with self.assertRaises(ollama_client.ollama.ResponseError):
+            list(self.client.generate("hi", stream=True))
+        self.assertEqual(len(self.chat_requests()), 1)
+
+    def test_batch_process_retries_each_prompt(self):
+        self.server.fail_next = 1
+        results = self.client.batch_process(["a", "b"], max_workers=1)
+        self.assertEqual([r["status"] for r in results.values()], ["success", "success"])
+
+    def test_timeout_stops_a_hung_request(self):
+        self.server.slow_seconds = 1.0
+        client = OllamaClient(self.server.url, timeout=0.2, retries=0)
+        start = time.monotonic()
+        with self.assertRaises(httpx.TimeoutException):
+            client.generate("slow", model="fake:1")
+        self.assertLess(time.monotonic() - start, 0.9)
+
+    def test_batch_process_reports_timeout_without_blocking_others(self):
+        self.server.slow_seconds = 1.0
+        client = OllamaClient(self.server.url, default_model="fake:1", timeout=0.2, retries=0)
+        results = client.batch_process(["slow", "ok"], max_workers=2)
+        self.assertEqual(results[0]["status"], "error")
+        self.assertEqual(results[1]["status"], "success")
+
+
+class TestModelManagement(FakeServerTestCase):
+    def test_pull_model_yields_progress(self):
+        events = list(self.client.pull_model("new:1"))
+        self.assertEqual(events[0]["status"], "pulling manifest")
+        self.assertEqual(events[-1]["status"], "success")
+        self.assertEqual((events[1]["completed"], events[1]["total"]), (50, 200))
+        self.assertIn("new:1", [m["name"] for m in self.client.list_models()])
+
+    def test_pull_missing_model_raises(self):
+        with self.assertRaises(ollama_client.ollama.ResponseError):
+            list(self.client.pull_model("missing"))
+
+    def test_show_model(self):
+        info = self.client.show_model("fake:1")
+        self.assertEqual(info["family"], "llama")
+        self.assertEqual(info["parameter_size"], "7B")
+        self.assertEqual(info["quantization_level"], "Q4_0")
+        self.assertEqual(info["capabilities"], ["completion"])
+
+    def test_show_defaults_to_default_model(self):
+        self.client.show_model()
+        self.assertEqual(self.server.requests[-1][1]["model"], "fake:1")
+
+    def test_delete_model(self):
+        self.client.delete_model("fake:1")
+        self.assertEqual([m["name"] for m in self.client.list_models()], ["nomic-embed-text:latest"])
+
+    def test_delete_missing_model_raises(self):
+        with self.assertRaises(ollama_client.ollama.ResponseError):
+            self.client.delete_model("missing")
 
 
 class TestChatSession(FakeServerTestCase):
@@ -232,6 +325,56 @@ class TestCli(FakeServerTestCase):
         self.assertEqual(rc, 0)
         self.assertIn("model exploded", err)
         self.assertIn("msgs=1 last=ok", out)
+
+    def test_pull_prints_progress(self):
+        rc, out, _ = self.run_cli("pull", "new:1")
+        self.assertEqual(rc, 0)
+        self.assertEqual(out.splitlines(),
+                         ["pulling manifest", "pulling abc: 25%", "pulling abc: 100%", "success"])
+
+    def test_pull_missing_model_exit_code(self):
+        rc, _, err = self.run_cli("pull", "missing")
+        self.assertEqual(rc, 1)
+        self.assertIn("does not exist", err)
+
+    def test_show(self):
+        rc, out, _ = self.run_cli("show", "fake:1")
+        self.assertEqual(rc, 0)
+        self.assertIn("parameter_size: 7B", out)
+        self.assertIn("capabilities: completion", out)
+
+    def test_show_without_name_uses_first_installed_model(self):
+        self.run_cli("show")
+        self.assertEqual(self.server.requests[-1][1]["model"], "fake:1")
+
+    def test_delete_with_yes(self):
+        rc, out, _ = self.run_cli("delete", "fake:1", "--yes")
+        self.assertEqual(rc, 0)
+        self.assertNotIn("fake:1", self.server.models)
+
+    def test_delete_without_yes_refuses_when_not_interactive(self):
+        rc, _, err = self.run_cli("delete", "fake:1")
+        self.assertEqual(rc, 2)
+        self.assertIn("fake:1", self.server.models)
+
+    def test_delete_confirmation_prompt(self):
+        stdin = io.StringIO("")
+        stdin.isatty = lambda: True
+        with mock.patch("sys.stdin", stdin), mock.patch("builtins.input", return_value="n"), \
+                contextlib.redirect_stdout(io.StringIO()):
+            rc = ollama_client.main(["--host", self.server.url, "delete", "fake:1"])
+        self.assertEqual(rc, 1)
+        self.assertIn("fake:1", self.server.models)
+
+    def test_delete_missing_model_exit_code(self):
+        rc, _, err = self.run_cli("delete", "missing", "-y")
+        self.assertEqual(rc, 1)
+
+    def test_timeout_and_retries_options_are_applied(self):
+        with mock.patch.object(ollama_client, "OllamaClient", wraps=OllamaClient) as cls:
+            self.run_cli("--timeout", "5", "--retries", "0", "list")
+        _, kwargs = cls.call_args
+        self.assertEqual((kwargs["timeout"], kwargs["retries"]), (5.0, 0))
 
     def test_connection_error_exit_code(self):
         out, err = io.StringIO(), io.StringIO()

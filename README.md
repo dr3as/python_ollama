@@ -12,10 +12,22 @@ python ollama_client.py ask "What is DNS?"           # single question
 cat auth.log | python ollama_client.py ask "Summarise suspicious activity" -s "You are a security analyst"
 python ollama_client.py chat                         # interactive, keeps history (/reset, /exit)
 python ollama_client.py embed "some text"            # embedding vector as JSON
+python ollama_client.py pull llama3                  # download a model with progress
+python ollama_client.py show llama3                  # family, size, quantization, capabilities
+python ollama_client.py delete llama3                # asks for confirmation (-y to skip)
 ```
 
-Global options (before the command): `--host URL` (env `OLLAMA_HOST`) and `-m/--model NAME`
-(env `OLLAMA_MODEL`; default is the first installed model).
+Global options (before the command): `--host URL` (env `OLLAMA_HOST`), `-m/--model NAME`
+(env `OLLAMA_MODEL`; default is the first installed model), `--timeout SECONDS` (default 120)
+and `--retries N` (default 2).
+
+## Timeouts and retries
+
+The timeout applies to each wait for data from the server, not to the whole request, so a long
+streamed answer is fine while data keeps arriving. Non-streaming calls (`generate`, `system_message`,
+`embed`, `list_models` and each prompt in `batch_process`) retry network errors, timeouts and
+HTTP 429/502/503/504 with exponential backoff (1 s, 2 s, ...). Streaming calls, `pull` and `delete`
+are never retried. In Python: `OllamaClient(timeout=30, retries=3, retry_delay=0.5)`.
 
 ## Python
 

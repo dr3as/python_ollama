@@ -3,7 +3,8 @@ import concurrent.futures
 import json
 import os
 import sys
-from typing import Any, Dict, Iterator, List, Optional, Union
+import time
+from typing import Any, Callable, Dict, Iterator, List, Optional, TypeVar, Union
 
 import httpx
 import ollama
@@ -11,6 +12,18 @@ import ollama
 DEFAULT_HOST = "http://localhost:11434"
 DEFAULT_MODEL = "llama2"
 DEFAULT_EMBED_MODEL = "nomic-embed-text"
+DEFAULT_TIMEOUT = 120.0  # seconds without data from the server before a request is abandoned
+DEFAULT_RETRIES = 2
+DEFAULT_RETRY_DELAY = 1.0  # first backoff in seconds; doubles on every further retry
+
+T = TypeVar("T")
+
+
+def _is_transient(error: Exception) -> bool:
+    """True for errors that may go away on a retry: network trouble, timeouts, overloaded server."""
+    if isinstance(error, ollama.ResponseError):
+        return error.status_code in (429, 502, 503, 504)
+    return isinstance(error, (ConnectionError, httpx.TransportError))
 
 
 class OllamaClient:
@@ -18,10 +31,29 @@ class OllamaClient:
         self,
         base_url: str = DEFAULT_HOST,
         default_model: str = DEFAULT_MODEL,
+        timeout: Optional[float] = DEFAULT_TIMEOUT,
+        retries: int = DEFAULT_RETRIES,
+        retry_delay: float = DEFAULT_RETRY_DELAY,
     ):
+        """timeout is httpx's per-operation limit (e.g. waiting for the next bytes), not a cap on
+        the whole request, so a long streamed answer is fine as long as data keeps arriving.
+        retries is the number of extra attempts for transient errors on non-streaming calls."""
         self.base_url = base_url.rstrip("/")
         self.default_model = default_model
-        self._client = ollama.Client(host=self.base_url)
+        self.retries = retries
+        self.retry_delay = retry_delay
+        self._client = ollama.Client(host=self.base_url, timeout=timeout)
+
+    def _with_retries(self, call: Callable[[], T]) -> T:
+        """Run call(), retrying transient errors with exponential backoff."""
+        for attempt in range(self.retries + 1):
+            try:
+                return call()
+            except Exception as e:
+                if attempt == self.retries or not _is_transient(e):
+                    raise
+                time.sleep(self.retry_delay * 2 ** attempt)
+        raise AssertionError("unreachable")
 
     def check_connection(self) -> bool:
         """Check whether Ollama is reachable."""
@@ -36,7 +68,7 @@ class OllamaClient:
         """Return the available models."""
         return [
             {"name": m.model, "modified_at": m.modified_at}
-            for m in self._client.list().models
+            for m in self._with_retries(self._client.list).models
         ]
 
     def generate(
@@ -52,16 +84,17 @@ class OllamaClient:
         if max_tokens is not None:
             options["num_predict"] = max_tokens
 
-        response = self._client.chat(
-            model=model or self.default_model,
-            messages=[{"role": "user", "content": prompt}],
-            stream=stream,
-            options=options,
-        )
+        def call():
+            return self._client.chat(
+                model=model or self.default_model,
+                messages=[{"role": "user", "content": prompt}],
+                stream=stream,
+                options=options,
+            )
 
-        if stream:
-            return self._iter_content(response)
-        return response.message.content or ""
+        if stream:  # never retried: chunks may already have been shown to the caller
+            return self._iter_content(call())
+        return self._with_retries(call).message.content or ""
 
     @staticmethod
     def _iter_content(chunks) -> Iterator[str]:
@@ -82,10 +115,10 @@ class OllamaClient:
 
         def process_prompt(index: int, prompt: str):
             try:
-                response = self._client.chat(
+                response = self._with_retries(lambda: self._client.chat(
                     model=model,
                     messages=[{"role": "user", "content": prompt}],
-                )
+                ))
                 return index, {"status": "success", "response": response.message.content}
             except Exception as e:
                 return index, {"status": "error", "error": str(e)}
@@ -105,19 +138,48 @@ class OllamaClient:
         model: Optional[str] = None,
     ) -> str:
         """Send a user prompt together with a system prompt and return the reply."""
-        response = self._client.chat(
+        response = self._with_retries(lambda: self._client.chat(
             model=model or self.default_model,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": prompt},
             ],
-        )
+        ))
         return response.message.content or ""
 
     def embed(self, text: str, model: Optional[str] = None) -> List[float]:
         """Return the embedding vector for the text."""
-        response = self._client.embed(model=model or DEFAULT_EMBED_MODEL, input=text)
+        response = self._with_retries(
+            lambda: self._client.embed(model=model or DEFAULT_EMBED_MODEL, input=text)
+        )
         return list(response.embeddings[0])
+
+    def pull_model(self, model: str) -> Iterator[Dict[str, Any]]:
+        """Download a model. Yields progress dicts with status, digest, completed and total."""
+        for progress in self._client.pull(model, stream=True):
+            yield {
+                "status": progress.status,
+                "digest": progress.digest,
+                "completed": progress.completed,
+                "total": progress.total,
+            }
+
+    def show_model(self, model: Optional[str] = None) -> Dict[str, Any]:
+        """Return details about an installed model."""
+        info = self._with_retries(lambda: self._client.show(model or self.default_model))
+        details = info.details
+        return {
+            "family": details.family if details else None,
+            "format": details.format if details else None,
+            "parameter_size": details.parameter_size if details else None,
+            "quantization_level": details.quantization_level if details else None,
+            "capabilities": list(info.capabilities or []),
+            "modified_at": info.modified_at,
+        }
+
+    def delete_model(self, model: str) -> None:
+        """Delete an installed model. Raises ollama.ResponseError if it does not exist."""
+        self._client.delete(model)
 
     def list_embeddings_models(self) -> List[str]:
         """List installed models that look like embedding models (name contains 'embed' or 'nomic')."""
@@ -288,6 +350,46 @@ def _cmd_embed(client: OllamaClient, args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_pull(client: OllamaClient, args: argparse.Namespace) -> int:
+    live = sys.stdout.isatty()  # rewrite one line in a terminal, plain lines otherwise
+    last_status = None
+    for p in client.pull_model(args.name):
+        if p["total"]:
+            percent = (p["completed"] or 0) * 100 // p["total"]
+            line = f"{p['status']}: {percent}%"
+            if live:
+                print(f"\r\033[K{line}", end="", flush=True)
+            elif p["completed"] == p["total"] or last_status != p["status"]:
+                print(line)
+            last_status = p["status"]
+        elif p["status"] != last_status:
+            print(("\n" if live and last_status else "") + p["status"])
+            last_status = p["status"]
+    return 0
+
+
+def _cmd_show(client: OllamaClient, args: argparse.Namespace) -> int:
+    info = client.show_model(args.name or _resolve_model(client, args.model))
+    for key, value in info.items():
+        if isinstance(value, list):
+            value = ", ".join(value)
+        print(f"{key}: {value}")
+    return 0
+
+
+def _cmd_delete(client: OllamaClient, args: argparse.Namespace) -> int:
+    if not args.yes:
+        if not sys.stdin.isatty():
+            print("Refusing to delete without confirmation: use --yes.", file=sys.stderr)
+            return 2
+        if input(f"Delete model {args.name}? [y/N] ").strip().lower() not in ("y", "yes"):
+            print("Cancelled.")
+            return 1
+    client.delete_model(args.name)
+    print(f"Deleted {args.name}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Talk to a local Ollama server.")
     parser.add_argument(
@@ -299,6 +401,14 @@ def build_parser() -> argparse.ArgumentParser:
         "-m", "--model",
         default=os.environ.get("OLLAMA_MODEL"),
         help="model name (env OLLAMA_MODEL, default: first installed model)",
+    )
+    parser.add_argument(
+        "--timeout", type=float, default=DEFAULT_TIMEOUT,
+        help=f"seconds to wait for data from the server (default {DEFAULT_TIMEOUT:g})",
+    )
+    parser.add_argument(
+        "--retries", type=int, default=DEFAULT_RETRIES,
+        help=f"extra attempts after a transient error (default {DEFAULT_RETRIES})",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -321,12 +431,25 @@ def build_parser() -> argparse.ArgumentParser:
     p_embed.add_argument("text")
     p_embed.set_defaults(func=_cmd_embed)
 
+    p_pull = sub.add_parser("pull", help="download a model, showing progress")
+    p_pull.add_argument("name")
+    p_pull.set_defaults(func=_cmd_pull)
+
+    p_show = sub.add_parser("show", help="show details about an installed model")
+    p_show.add_argument("name", nargs="?", help="model name (default: --model, else the first installed)")
+    p_show.set_defaults(func=_cmd_show)
+
+    p_delete = sub.add_parser("delete", help="delete an installed model")
+    p_delete.add_argument("name")
+    p_delete.add_argument("-y", "--yes", action="store_true", help="don't ask for confirmation")
+    p_delete.set_defaults(func=_cmd_delete)
+
     return parser
 
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = build_parser().parse_args(argv)
-    client = OllamaClient(args.host)
+    client = OllamaClient(args.host, timeout=args.timeout, retries=args.retries)
     try:
         return args.func(client, args)
     except KeyboardInterrupt:
