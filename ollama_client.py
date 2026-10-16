@@ -254,6 +254,40 @@ class OllamaClient:
             for m in self._with_retries(self._client.ps).models  # "ps" = process status
         ]
 
+    def unload_model(self, model: str) -> None:
+        """Free the model's memory now instead of waiting for Ollama's idle timeout (5 minutes).
+
+        Ollama has no "unload" endpoint. The documented way is a request for that model with
+        keep_alive=0 ("keep it loaded for zero seconds"), which unloads it as soon as it is done.
+        Used by the model comparison so each model starts from an empty GPU.
+        """
+        self._with_retries(lambda: self._client.generate(model=model, keep_alive=0))
+
+    def stream_chat(self, messages: List[Dict[str, str]], model: Optional[str] = None,
+                    temperature: float = 0.7) -> Iterator[Any]:
+        """Start a streamed chat and return the raw chunks (the last one carries the timings).
+
+        Unlike generate(), nothing is stripped away, so callers can time the first chunk and read
+        chat_stats() from the final one. Not retried, for the same reason as generate(stream=True).
+        """
+        return self._client.chat(
+            model=model or self.default_model,
+            messages=messages,
+            stream=True,
+            options={"temperature": temperature},
+        )
+
+    def chat_once(self, messages: List[Dict[str, str]], model: Optional[str] = None,
+                  temperature: float = 0.0, json_format: bool = False) -> str:
+        """One non-streamed chat call returning the reply text. json_format asks for valid JSON."""
+        response = self._with_retries(lambda: self._client.chat(
+            model=model or self.default_model,
+            messages=messages,
+            options={"temperature": temperature},
+            format="json" if json_format else None,
+        ))
+        return response.message.content or ""
+
     def delete_model(self, model: str) -> None:
         """Delete an installed model. Raises ollama.ResponseError if it does not exist."""
         # Not retried, so a repeated delete can never hit a model that was already removed.

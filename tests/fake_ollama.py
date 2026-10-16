@@ -40,6 +40,17 @@ class FakeOllama:
         self.context_length = 4096
         self.running = [self.models[0]] if self.models else []  # what /api/ps reports as loaded
         self.slow_seconds = 1.0
+        # --- model loading, used by the compare tests ---
+        # A chat request "loads" its model, and a keep_alive=0 request unloads it, like the real
+        # server. `events` records both, and `max_loaded` the most models that were ever loaded
+        # at once, which is how the tests prove that comparisons run one model at a time.
+        self.events = []
+        self.max_loaded = len(self.running)
+        self.stuck = set()  # models that refuse to unload
+        self.sizes = {}  # model -> (size, size_vram) in bytes for /api/ps
+        self.delays = {}  # model -> seconds before its first reply chunk
+        self.bad_models = set()  # chat requests for these models fail with HTTP 500
+        self.judge_reply = None  # text returned for chat requests asking for JSON
         # Inside the nested Handler class, `self` is the request handler, not the FakeOllama.
         # `outer` is how the handler reaches the fake's state (models, requests, ...).
         outer = self
@@ -67,7 +78,9 @@ class FakeOllama:
             def do_GET(self):
                 if self.path == "/api/ps":
                     return self._json({"models": [
-                        {"model": m, "name": m, "size": 4_000_000_000, "size_vram": 3_000_000_000,
+                        {"model": m, "name": m,
+                         "size": outer.sizes.get(m, (4_000_000_000, 3_000_000_000))[0],
+                         "size_vram": outer.sizes.get(m, (4_000_000_000, 3_000_000_000))[1],
                          "context_length": outer.context_length,
                          "expires_at": (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()}
                         for m in outer.running
@@ -116,6 +129,14 @@ class FakeOllama:
                         self.wfile.write((json.dumps(event) + "\n").encode())
                     outer.models.append(body["model"])
                     return
+                if self.path == "/api/generate":
+                    # Only the "unload" form is supported: {"model": ..., "keep_alive": 0}.
+                    if body.get("keep_alive") == 0 and body["model"] not in outer.stuck:
+                        if body["model"] in outer.running:
+                            outer.running.remove(body["model"])
+                            outer.events.append(("unload", body["model"]))
+                    return self._json({"model": body["model"], "response": "", "done": True,
+                                       "done_reason": "unload"})
                 if self.path == "/api/embed":
                     return self._json({"model": body["model"], "embeddings": [[0.1, 0.2, 0.3]]})
 
@@ -125,12 +146,22 @@ class FakeOllama:
 
                 # Chat: the reply echoes how many messages it got and the last one, so tests can
                 # check that history is sent ("msgs=3 ...") without needing a real model.
+                if body["model"] in outer.bad_models:
+                    return self._json({"error": "model failed to load"}, status=500)
+                if body["model"] not in outer.running:
+                    outer.running.append(body["model"])
+                    outer.events.append(("load", body["model"]))
+                    outer.max_loaded = max(outer.max_loaded, len(outer.running))
+                time.sleep(outer.delays.get(body["model"], 0))
+
                 last = body["messages"][-1]["content"]
                 if last == "slow":
                     time.sleep(outer.slow_seconds)
                 if last == "boom":
                     return self._json({"error": "model exploded"}, status=500)
                 text = f"msgs={len(body['messages'])} last={last}"
+                if body.get("format") == "json":  # the compare judge asks for JSON
+                    text = outer.judge_reply or "{}"
                 if not body.get("stream", True):
                     return self._json({
                         "model": body["model"],
