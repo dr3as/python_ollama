@@ -1,10 +1,18 @@
 import asyncio
+import subprocess
 import unittest
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
+from unittest import mock
 
-from textual.widgets import Input, ListView
+from textual.widgets import Input, ListView, TabbedContent
 
 from ollama_client import OllamaClient
-from ollama_tui import ChatStore, ConfirmScreen, InfoScreen, OllamaTui, format_stats
+import ollama_tui
+from ollama_tui import (
+    ChatStore, ConfirmScreen, InfoScreen, OllamaTui, format_bytes, format_resources, format_stats,
+    is_local_host, parse_nvidia_smi, read_gpus, read_host_stats,
+)
 from tests.fake_ollama import FakeOllama
 
 
@@ -86,6 +94,124 @@ class TestFormatStats(unittest.TestCase):
 
     def test_live_with_no_elapsed_time(self):
         self.assertEqual(format_stats(None, None, 0, live=(1, 0.0)), "receiving: ~1 tokens")
+
+
+SMI_OUTPUT = "NVIDIA GeForce RTX 3070, 63, 6144, 8192, 58\n"
+GPU = {"name": "NVIDIA GeForce RTX 3070", "util_percent": 63.0, "vram_used": 6144 * 2**20,
+       "vram_total": 8192 * 2**20, "temperature": 58.0}
+HOST = {"cpu_percent": 34.0, "ram_used": 12.1e9, "ram_total": 31.2e9}
+MODEL = {"name": "llama3:8b", "size": 5_200_000_000, "size_vram": 5_200_000_000,
+         "context_length": 4096, "expires_at": None}
+
+
+class TestIsLocalHost(unittest.TestCase):
+    def test_local_urls(self):
+        for url in ("http://localhost:11434", "localhost", "http://127.0.0.1:11434",
+                    "http://127.0.1.1", "http://[::1]:11434", "http://0.0.0.0:11434"):
+            self.assertTrue(is_local_host(url), url)
+
+    def test_remote_urls(self):
+        for url in ("http://192.168.1.5:11434", "http://server:11434", "https://ollama.example.com"):
+            self.assertFalse(is_local_host(url), url)
+
+    def test_own_hostname_counts_as_local(self):
+        with mock.patch("socket.gethostname", return_value="myserver"):
+            self.assertTrue(is_local_host("http://myserver:11434"))
+
+
+class TestHostReaders(unittest.TestCase):
+    def test_parse_nvidia_smi(self):
+        self.assertEqual(parse_nvidia_smi(SMI_OUTPUT), [GPU])
+
+    def test_parse_handles_na_values_and_bad_lines(self):
+        gpus = parse_nvidia_smi("Tesla T4, [N/A], 100, 200, [N/A]\nbroken line\n")
+        self.assertEqual(len(gpus), 1)
+        self.assertIsNone(gpus[0]["util_percent"])
+        self.assertIsNone(gpus[0]["temperature"])
+        self.assertEqual(gpus[0]["vram_total"], 200 * 2**20)
+
+    def test_parse_empty_output(self):
+        self.assertEqual(parse_nvidia_smi(""), [])
+
+    def test_read_gpus_without_nvidia_smi(self):
+        with mock.patch("shutil.which", return_value=None):
+            self.assertIsNone(read_gpus())
+
+    def test_read_gpus_parses_command_output(self):
+        done = subprocess.CompletedProcess([], 0, stdout=SMI_OUTPUT)
+        with mock.patch("shutil.which", return_value="/usr/bin/nvidia-smi"), \
+                mock.patch("subprocess.run", return_value=done) as run:
+            self.assertEqual(read_gpus(), [GPU])
+        self.assertIn("--format=csv,noheader,nounits", run.call_args.args[0])
+
+    def test_read_gpus_returns_none_when_command_fails(self):
+        for error in (subprocess.CalledProcessError(9, "nvidia-smi"), FileNotFoundError(),
+                      subprocess.TimeoutExpired("nvidia-smi", 3)):
+            with mock.patch("shutil.which", return_value="/usr/bin/nvidia-smi"), \
+                    mock.patch("subprocess.run", side_effect=error):
+                self.assertIsNone(read_gpus())
+
+    def test_read_host_stats_without_psutil(self):
+        with mock.patch.object(ollama_tui, "psutil", None):
+            self.assertIsNone(read_host_stats())
+
+    def test_read_host_stats_with_psutil(self):
+        fake = SimpleNamespace(cpu_percent=lambda: 12.5,
+                               virtual_memory=lambda: SimpleNamespace(used=4e9, total=16e9))
+        with mock.patch.object(ollama_tui, "psutil", fake):
+            self.assertEqual(read_host_stats(),
+                             {"cpu_percent": 12.5, "ram_used": 4e9, "ram_total": 16e9})
+
+
+class TestFormatResources(unittest.TestCase):
+    def test_format_bytes(self):
+        self.assertEqual(format_bytes(5.2e9), "5.2 GB")
+        self.assertEqual(format_bytes(5e7), "50 MB")
+
+    def test_model_fully_on_gpu(self):
+        text = format_resources([MODEL], None, True, HOST, [GPU])
+        self.assertIn("llama3:8b", text)
+        self.assertIn("5.2 GB · 100% GPU", text)
+        self.assertIn("ctx 4,096", text)
+        self.assertNotIn("⚠", text)
+
+    def test_model_spilling_onto_cpu_is_flagged(self):
+        spilled = {**MODEL, "size": 10_000_000_000, "size_vram": 6_000_000_000}
+        text = format_resources([spilled], None, False, None, None)
+        self.assertIn("60% GPU / 40% CPU ⚠", text)
+
+    def test_unload_countdown(self):
+        soon = {**MODEL, "expires_at": datetime.now(timezone.utc) + timedelta(minutes=4, seconds=30)}
+        self.assertIn("unloads in 4m", format_resources([soon], None, False, None, None))
+        gone = {**MODEL, "expires_at": datetime.now(timezone.utc) - timedelta(seconds=5)}
+        self.assertIn("unloading", format_resources([gone], None, False, None, None))
+
+    def test_no_model_loaded_and_error(self):
+        self.assertIn("none (a model loads", format_resources([], None, False, None, None))
+        self.assertIn("Cannot reach Ollama", format_resources(None, "Cannot reach Ollama: x", False, None, None))
+
+    def test_remote_host_shows_no_local_numbers(self):
+        text = format_resources([MODEL], None, False, HOST, [GPU])
+        self.assertIn("only", text)
+        self.assertIn("localhost", text)
+        self.assertNotIn("RAM  ", text)  # the meter line, not the word in the note
+        self.assertNotIn("RTX", text)
+
+    def test_local_numbers(self):
+        text = format_resources([], None, True, HOST, [GPU])
+        self.assertIn("CPU  ███░░░░░░░ 34%", text)
+        self.assertIn("RAM  ████░░░░░░ 39%", text)
+        self.assertIn("12.1 GB / 31.2 GB", text)
+        self.assertIn("NVIDIA GeForce RTX 3070", text)
+        self.assertIn("load ██████░░░░ 63%", text)
+        self.assertIn("VRAM ████████░░ 75%", text)
+        self.assertIn("6.4 GB / 8.6 GB", text)
+        self.assertIn("temp 58 °C", text)
+
+    def test_local_hints_when_tools_are_missing(self):
+        text = format_resources([], None, True, None, None)
+        self.assertIn("install psutil", text)
+        self.assertIn("nvidia-smi not available", text)
 
 
 class TuiTestCase(AsyncTestCase):
@@ -304,6 +430,74 @@ class TestTui(TuiTestCase):
     async def test_sidebar_starts_hidden_on_narrow_terminal(self):
         async with self.app.run_test(size=(80, 30)) as pilot:
             self.assertTrue(self.app.query_one("#sidebar").has_class("hidden"))
+
+
+class TestResourcesTab(TuiTestCase):
+    FAKE_PSUTIL = SimpleNamespace(cpu_percent=lambda: 34.0,
+                                  virtual_memory=lambda: SimpleNamespace(used=12.1e9, total=31.2e9))
+
+    async def show_tab(self, pilot):
+        self.app.query_one(TabbedContent).active = "tab-resources"
+        await pilot.pause()
+        await self.settle(pilot)
+
+    async def test_local_host_shows_ollama_and_machine_numbers(self):
+        with mock.patch.object(ollama_tui, "psutil", self.FAKE_PSUTIL), \
+                mock.patch.object(ollama_tui, "read_gpus", return_value=[GPU]):
+            async with self.app.run_test(size=(120, 40)) as pilot:
+                await self.settle(pilot)
+                self.assertEqual(self.app.resources_text, "")  # nothing polled while the tab is hidden
+                await self.show_tab(pilot)
+                text = self.app.resources_text
+        self.assertIn("fake:1", text)
+        self.assertIn("75% GPU / 25% CPU", text)
+        self.assertIn("ctx 4,096", text)
+        self.assertIn("CPU  ███░░░░░░░ 34%", text)
+        self.assertIn("RTX 3070", text)
+
+    async def test_remote_host_hides_machine_numbers(self):
+        self.app.is_local = False
+        with mock.patch.object(ollama_tui, "read_gpus", side_effect=AssertionError("must not run")):
+            async with self.app.run_test(size=(120, 40)) as pilot:
+                await self.settle(pilot)
+                await self.show_tab(pilot)
+                text = self.app.resources_text
+        self.assertIn("fake:1", text)
+        self.assertIn("only shown when Ollama runs on this", text.replace("\n  ", " "))
+        self.assertNotIn("RAM  ", text)
+        self.assertIn("unloads in 4m", text)
+
+    async def test_refreshes_while_visible(self):
+        async with self.app.run_test(size=(120, 40)) as pilot:
+            await self.settle(pilot)
+            await self.show_tab(pilot)
+            self.assertIn("fake:1", self.app.resources_text)
+            self.server.running.clear()
+            await pilot.pause(2.5)
+            await self.settle(pilot)
+            self.assertIn("none (a model loads", self.app.resources_text)
+
+    async def test_no_polling_when_sidebar_hidden(self):
+        async with self.app.run_test(size=(120, 40)) as pilot:
+            await self.settle(pilot)
+            await self.show_tab(pilot)
+            await pilot.press("ctrl+b")
+            self.server.running.clear()
+            await pilot.pause(2.5)
+            await self.settle(pilot)
+            self.assertIn("fake:1", self.app.resources_text)  # stale: hidden panel is not refreshed
+
+    async def test_server_down_shows_error_in_tab(self):
+        from tests.test_ollama_client import unused_url
+        from ollama_client import OllamaClient
+        app = OllamaTui(OllamaClient(unused_url(), retries=0), self.store)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await app.workers.wait_for_complete()
+            app.query_one(TabbedContent).active = "tab-resources"
+            await pilot.pause()
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            self.assertIn("Cannot reach Ollama", app.resources_text)
 
 
 class TestTuiOffline(AsyncTestCase):

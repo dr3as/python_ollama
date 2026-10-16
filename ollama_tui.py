@@ -3,13 +3,18 @@
 Run with `python3 ollama_tui.py`. Chats are saved automatically in a SQLite database.
 """
 import argparse
+import ipaddress
 import os
+import shutil
+import socket
 import sqlite3
+import subprocess
 import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
 import httpx
 import ollama
@@ -24,6 +29,11 @@ from textual.widgets import (
     Button, Footer, Header, Input, Label, ListItem, ListView,
     Markdown, ProgressBar, Static, TabbedContent, TabPane,
 )
+
+try:
+    import psutil  # optional: CPU and RAM of this machine
+except ImportError:
+    psutil = None
 
 from ollama_client import (
     DEFAULT_HOST, DEFAULT_RETRIES, DEFAULT_TIMEOUT, ChatSession, OllamaClient,
@@ -160,6 +170,142 @@ def format_stats(last: Optional[Dict[str, Any]], context_total: Optional[int],
         parts.append(f"load {last['load_seconds']:.1f}s")
     parts.append(f"session {session_tokens:,} out")
     return " · ".join(parts)
+
+
+NVIDIA_SMI_QUERY = "name,utilization.gpu,memory.used,memory.total,temperature.gpu"
+
+
+def is_local_host(url: str) -> bool:
+    """True when the Ollama URL points at this machine, so local CPU/RAM/GPU numbers apply."""
+    host = urlparse(url if "//" in url else f"//{url}").hostname or ""
+    if host in ("localhost", socket.gethostname()):
+        return True
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return address.is_loopback or address.is_unspecified
+
+
+def read_host_stats() -> Optional[Dict[str, float]]:
+    """CPU percent and RAM bytes of this machine, or None when psutil is not installed."""
+    if psutil is None:
+        return None
+    memory = psutil.virtual_memory()
+    return {"cpu_percent": psutil.cpu_percent(), "ram_used": memory.used, "ram_total": memory.total}
+
+
+def parse_nvidia_smi(output: str) -> List[Dict[str, Any]]:
+    """Parse `nvidia-smi --query-gpu=NVIDIA_SMI_QUERY --format=csv,noheader,nounits` (MiB values)."""
+    def number(text: str) -> Optional[float]:
+        try:
+            return float(text)
+        except ValueError:
+            return None  # e.g. "[N/A]"
+
+    gpus = []
+    for line in output.strip().splitlines():
+        fields = [f.strip() for f in line.split(",")]
+        if len(fields) != 5:
+            continue
+        used, total = number(fields[2]), number(fields[3])
+        gpus.append({
+            "name": fields[0],
+            "util_percent": number(fields[1]),
+            "vram_used": used * 2**20 if used is not None else None,
+            "vram_total": total * 2**20 if total is not None else None,
+            "temperature": number(fields[4]),
+        })
+    return gpus
+
+
+def read_gpus() -> Optional[List[Dict[str, Any]]]:
+    """NVIDIA GPUs of this machine, or None when nvidia-smi is missing or fails."""
+    if shutil.which("nvidia-smi") is None:
+        return None
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", f"--query-gpu={NVIDIA_SMI_QUERY}", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=3, check=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return parse_nvidia_smi(result.stdout) or None
+
+
+def format_bytes(size: float) -> str:
+    return f"{size / 1e9:.1f} GB" if size >= 1e8 else f"{size / 1e6:.0f} MB"
+
+
+def _bar(percent: Optional[float], width: int = 10) -> str:
+    if percent is None:
+        return "?" * width
+    filled = round(max(0, min(100, percent)) / 100 * width)
+    return "█" * filled + "░" * (width - filled)
+
+
+def _expires_in(expires_at: Optional[datetime]) -> str:
+    if expires_at is None:
+        return ""
+    seconds = int((expires_at - datetime.now(timezone.utc)).total_seconds())
+    if seconds <= 0:
+        return "unloading"
+    return f"unloads in {seconds // 60}m" if seconds >= 60 else f"unloads in {seconds}s"
+
+
+def format_resources(loaded: Optional[List[Dict[str, Any]]], error: Optional[str], local: bool,
+                     host: Optional[Dict[str, float]], gpus: Optional[List[Dict[str, Any]]]) -> str:
+    """Text for the Resources tab. loaded comes from Ollama (any host); host and gpus only if local."""
+    lines = ["LOADED MODELS (from Ollama)"]
+    if error:
+        lines.append(f"  {error}")
+    elif not loaded:
+        lines.append("  none (a model loads on its first request)")
+    for m in loaded or []:
+        lines.append(f"  {m['name']}")
+        size, in_vram = m["size"], m["size_vram"]
+        if size and in_vram >= size:
+            where = "100% GPU"
+        elif size:
+            gpu = in_vram * 100 // size
+            where = f"{gpu}% GPU / {100 - gpu}% CPU ⚠"
+        else:
+            where = "size unknown"
+        lines.append(f"    {format_bytes(size)} · {where}")
+        extra = [f"ctx {m['context_length']:,}"] if m.get("context_length") else []
+        extra.append(_expires_in(m.get("expires_at")))
+        lines.append("    " + " · ".join(e for e in extra if e))
+    lines.append("")
+
+    if not local:
+        lines += ["THIS MACHINE", "  CPU, RAM and GPU load are only",
+                  "  shown when Ollama runs on this",
+                  "  machine (localhost). The numbers",
+                  "  above come from the Ollama server."]
+        return "\n".join(lines)
+
+    lines.append("THIS MACHINE")
+    if host is None:
+        lines.append("  CPU/RAM: install psutil")
+        lines.append("  (apt: python3-psutil)")
+    else:
+        ram_percent = host["ram_used"] * 100 / host["ram_total"] if host["ram_total"] else 0
+        lines.append(f"  CPU  {_bar(host['cpu_percent'])} {host['cpu_percent']:.0f}%")
+        lines.append(f"  RAM  {_bar(ram_percent)} {ram_percent:.0f}%")
+        lines.append(f"       {format_bytes(host['ram_used'])} / {format_bytes(host['ram_total'])}")
+    if gpus is None:
+        lines.append("  GPU: nvidia-smi not available")
+    for gpu in gpus or []:
+        lines.append(f"  GPU  {gpu['name']}")
+        util = gpu["util_percent"]
+        lines.append(f"  load {_bar(util)} {'?' if util is None else f'{util:.0f}'}%")
+        used, total = gpu["vram_used"], gpu["vram_total"]
+        if used is not None and total:
+            lines.append(f"  VRAM {_bar(used * 100 / total)} {used * 100 / total:.0f}%")
+            lines.append(f"       {format_bytes(used)} / {format_bytes(total)}")
+        if gpu["temperature"] is not None:
+            lines.append(f"  temp {gpu['temperature']:.0f} °C")
+    return "\n".join(lines)
 
 
 class CommandSuggester(Suggester):
@@ -321,6 +467,9 @@ class OllamaTui(App):
         self.session_tokens = 0  # reply tokens received since the app started
         self._live: Optional[tuple] = None  # (chunks, seconds) while a reply streams in
         self.status_text = ""  # what the status bar shows (also read by the tests)
+        self.is_local = is_local_host(client.base_url)
+        self.resources_text = ""  # what the Resources tab shows (also read by the tests)
+        self._polling = False
         self.sub_title = host_label or client.base_url
 
     # ---- layout -------------------------------------------------------------------------
@@ -345,6 +494,9 @@ class OllamaTui(App):
                         with Horizontal(classes="buttons"):
                             yield Button("New", id="new-chat", variant="primary")
                             yield Button("Delete", id="delete-chat", variant="error")
+                    with TabPane("Resources", id="tab-resources"):
+                        with VerticalScroll():
+                            yield Static("Loading...", id="resources")
                     with TabPane("Settings", id="tab-settings"):
                         yield Label("System prompt (Enter to apply)", classes="field-label")
                         yield Input(id="setting-system")
@@ -373,6 +525,9 @@ class OllamaTui(App):
         self._refresh_chats()
         self._load_models(select_first=self.model is None)
         self._update_status()
+        if psutil is not None:
+            psutil.cpu_percent()  # the first call has no earlier sample to compare with
+        self.set_interval(2.0, self._poll_resources)
 
     # ---- status and small helpers -------------------------------------------------------------
 
@@ -656,6 +811,40 @@ class OllamaTui(App):
     @on(Input.Submitted, "#setting-temp")
     def _temp_submitted(self, event: Input.Submitted) -> None:
         self._apply_temperature(event.value.strip())
+
+    # ---- resources ----------------------------------------------------------------------------
+
+    def _resources_visible(self) -> bool:
+        return (self.query_one(TabbedContent).active == "tab-resources"
+                and not self.query_one("#sidebar").has_class("hidden"))
+
+    @on(TabbedContent.TabActivated)
+    def _tab_activated(self) -> None:
+        self._poll_resources()
+
+    def _poll_resources(self) -> None:
+        """Refresh the Resources tab, but only while it is on screen and the last read is done."""
+        if self._polling or not self._resources_visible():
+            return
+        self._polling = True
+        self._read_resources()
+
+    @work(thread=True, exit_on_error=False, group="resources")
+    def _read_resources(self) -> None:
+        loaded: Optional[List[Dict[str, Any]]] = None
+        error: Optional[str] = None
+        try:
+            loaded = self.client.running_models()
+        except Exception as e:
+            error = _describe(e)
+        host = read_host_stats() if self.is_local else None
+        gpus = read_gpus() if self.is_local else None
+        self.call_from_thread(self._show_resources, loaded, error, host, gpus)
+
+    def _show_resources(self, loaded, error, host, gpus) -> None:
+        self.resources_text = format_resources(loaded, error, self.is_local, host, gpus)
+        self.query_one("#resources", Static).update(Text(self.resources_text))
+        self._polling = False
 
     # ---- models -------------------------------------------------------------------------------
 

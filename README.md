@@ -19,6 +19,7 @@ are `python3-ollama` 0.6.1 and `python3-textual` 2.1.2):
 
 ```bash
 sudo apt install python3-ollama python3-textual
+sudo apt install python3-psutil    # optional: CPU/RAM numbers in the TUI's Resources tab
 ```
 
 apt pulls in the rest (`python3-httpx`, `python3-pydantic`, `python3-rich`, ...). The CLI
@@ -38,6 +39,13 @@ than 100 columns) with three tabs:
 
 - **Models**: installed models (Enter selects one), Show, Delete (asks first), Refresh, and a Pull field with a progress bar.
 - **Chats**: saved conversations (Enter loads one), New, Delete.
+- **Resources**: refreshed every 2 s while the tab is open. *Loaded models* come from Ollama's
+  `/api/ps` and work against any host: size, how much sits in GPU memory versus system RAM
+  (`60% GPU / 40% CPU ⚠` means part of the model runs on the CPU, which is much slower), the
+  context size and when the model unloads. *This machine* (CPU, RAM, NVIDIA GPU load, VRAM and
+  temperature) is shown only when Ollama runs on this computer (`localhost`, a loopback address or
+  this machine's hostname), because a remote Ollama cannot report its host's load. CPU/RAM need
+  `psutil`, the GPU numbers need `nvidia-smi`; if either is missing the tab says so.
 - **Settings**: system prompt and temperature.
 
 Everything is also available as slash commands, with suggestions while you type (press → to

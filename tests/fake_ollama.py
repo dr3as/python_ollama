@@ -3,6 +3,7 @@ import http.server
 import json
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 
 
 def stats(body, text):
@@ -54,7 +55,8 @@ class FakeOllama:
                 if self.path == "/api/ps":
                     return self._json({"models": [
                         {"model": m, "name": m, "size": 4_000_000_000, "size_vram": 3_000_000_000,
-                         "context_length": 4096, "expires_at": "2026-01-01T00:05:00Z"}
+                         "context_length": 4096,
+                         "expires_at": (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()}
                         for m in outer.running
                     ]})
                 self._json({"models": [

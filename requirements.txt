@@ -1,2 +1,4 @@
 ollama>=0.4
 textual>=2.1
+# optional: CPU/RAM numbers in the TUI Resources tab (apt: python3-psutil)
+psutil>=5.9
