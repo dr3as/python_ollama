@@ -175,6 +175,14 @@ class AssistantMessage(Markdown):
         return super().update(markdown)
 
 
+class UserMessage(Static):
+    """A plain-text message that remembers its text."""
+
+    def __init__(self, text: str, **kwargs):
+        super().__init__(Text(text), **kwargs)
+        self.text = text
+
+
 class InfoScreen(ModalScreen[None]):
     BINDINGS = [Binding("escape,enter,q", "dismiss_screen", "Close")]
 
@@ -401,7 +409,7 @@ class OllamaTui(App):
             return
         for m in messages:
             if m["role"] == "user":
-                await log.mount(Static(Text(m["content"]), classes="msg user"))
+                await log.mount(UserMessage(m["content"], classes="msg user"))
             elif m["role"] == "assistant":
                 await log.mount(AssistantMessage(m["content"], classes="msg assistant"))
         log.scroll_end(animate=False)
@@ -416,7 +424,7 @@ class OllamaTui(App):
         log = self.query_one("#log", VerticalScroll)
         for welcome in self.query("#welcome"):
             await welcome.remove()
-        await log.mount(Static(Text(text), classes="msg user"))
+        await log.mount(UserMessage(text, classes="msg user"))
         reply = AssistantMessage("…", classes="msg assistant")
         await log.mount(reply)
         log.scroll_end(animate=False)

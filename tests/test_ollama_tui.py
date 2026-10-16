@@ -4,7 +4,7 @@ import unittest
 from textual.widgets import Input, ListView
 
 from ollama_client import OllamaClient
-from ollama_tui import AssistantMessage, ChatStore, ConfirmScreen, InfoScreen, OllamaTui
+from ollama_tui import ChatStore, ConfirmScreen, InfoScreen, OllamaTui
 from tests.fake_ollama import FakeOllama
 
 
@@ -77,7 +77,7 @@ class TuiTestCase(AsyncTestCase):
         await self.settle(pilot)
 
     def log_texts(self):
-        return [str(w.text if isinstance(w, AssistantMessage) else w.renderable)
+        return [w.text
                 for w in self.app.query("#log .msg")]
 
 
