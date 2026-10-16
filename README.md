@@ -48,7 +48,7 @@ than 100 columns) with three tabs:
   `psutil`, the GPU numbers need `nvidia-smi`; if either is missing the tab says so.
 - **Settings**: system prompt and temperature.
 
-Everything is also available as slash commands, with suggestions while you type (press → to
+Everything is also available as slash commands, with suggestions while you type (press Tab or → to
 accept): `/help`, `/new`, `/model [name]`, `/pull name`, `/show [name]`, `/delete name`,
 `/system [text]`, `/temp [number]`, `/rename title`, `/quit`.
 Esc stops a running reply, Ctrl+N starts a new chat, Ctrl+Q quits. Replies are rendered as

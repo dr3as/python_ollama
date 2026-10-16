@@ -10,8 +10,8 @@ from textual.widgets import Input, ListView, TabbedContent
 from ollama_client import OllamaClient
 import ollama_tui
 from ollama_tui import (
-    ChatStore, ConfirmScreen, InfoScreen, OllamaTui, format_bytes, format_resources, format_stats,
-    is_local_host, parse_nvidia_smi, read_gpus, read_host_stats,
+    ChatStore, ChoiceScreen, ConfirmScreen, InfoScreen, OllamaTui, format_bytes, format_resources, format_stats,
+    context_percent, is_local_host, parse_nvidia_smi, read_gpus, read_host_stats,
 )
 from tests.fake_ollama import FakeOllama
 
@@ -87,6 +87,16 @@ class TestFormatStats(unittest.TestCase):
     def test_load_time_shown_only_when_noticeable(self):
         self.assertNotIn("load", format_stats(LAST, 4096, 0))
         self.assertIn("load 3.2s", format_stats({**LAST, "load_seconds": 3.2}, 4096, 0))
+
+    def test_context_percent(self):
+        self.assertEqual(context_percent(LAST, 4096), 36)
+        self.assertIsNone(context_percent(LAST, None))
+        self.assertIsNone(context_percent(None, 4096))
+
+    def test_warning_mark_from_80_percent(self):
+        self.assertNotIn("⚠", format_stats(LAST, 4096, 0))  # 36%
+        near_full = {**LAST, "prompt_tokens": 1900, "reply_tokens": 100}  # 2000 of 2400 = 83%
+        self.assertIn("(83%) ⚠", format_stats(near_full, 2400, 0))
 
     def test_live_numbers_while_streaming(self):
         self.assertEqual(format_stats(LAST, 4096, 0, live=(50, 2.0)),
@@ -233,7 +243,7 @@ class TuiTestCase(AsyncTestCase):
 
     def log_texts(self):
         return [w.text
-                for w in self.app.query("#log .msg")]
+                for w in self.app.main_screen.query("#log .msg")]
 
 
 class TestTui(TuiTestCase):
@@ -292,6 +302,113 @@ class TestTui(TuiTestCase):
             self.assertFalse(self.app.busy)
             self.assertIn("ready", self.app.status_text)
             self.assertEqual(self.log_texts()[-1], "msgs=1 last=slow")
+
+    async def test_prompt_tab_completes_command_and_model_name(self):
+        async with self.app.run_test(size=(120, 40)) as pilot:
+            await self.settle(pilot)
+            prompt = self.app.query_one("#prompt", Input)
+            prompt.value = "/mo"
+            await pilot.pause()
+            await pilot.press("tab")
+            self.assertEqual(prompt.value, "/model")
+            prompt.value = "/model nomic"
+            await pilot.pause()
+            await pilot.press("tab")
+            self.assertEqual(prompt.value, "/model nomic-embed-text:latest")
+            self.assertIs(self.app.focused, prompt)
+
+    async def test_tab_moves_focus_when_there_is_nothing_to_complete(self):
+        async with self.app.run_test(size=(120, 40)) as pilot:
+            await self.settle(pilot)
+            prompt = self.app.query_one("#prompt", Input)
+            prompt.value = "hello"
+            await pilot.pause()
+            await pilot.press("tab")
+            self.assertEqual(prompt.value, "hello")
+            self.assertIsNot(self.app.focused, prompt)
+
+    async def test_warns_once_per_level_as_context_fills(self):
+        self.server.context_length = 15  # replies use 12, then 32 tokens
+        async with self.app.run_test(size=(120, 40)) as pilot:
+            await self.settle(pilot)
+            with mock.patch.object(OllamaTui, "notify") as notify:
+                await self.say(pilot, "one")
+                await self.settle(pilot)
+                self.assertEqual([c.kwargs["severity"] for c in notify.call_args_list], ["warning"])  # 80%
+                self.assertIn("⚠", self.app.status_text)
+                await self.say(pilot, "two")
+                await self.settle(pilot)
+                self.assertEqual([c.kwargs["severity"] for c in notify.call_args_list],
+                                 ["warning", "error"])  # full
+                await self.say(pilot, "three")
+                await self.settle(pilot)
+                self.assertEqual(notify.call_count, 2)  # no repeats
+                await self.say(pilot, "/new")
+                await self.say(pilot, "again")
+                await self.settle(pilot)
+                self.assertEqual(notify.call_count, 3)  # a new chat warns again
+
+    async def test_no_warning_when_context_is_roomy(self):
+        async with self.app.run_test(size=(120, 40)) as pilot:
+            await self.settle(pilot)
+            with mock.patch.object(OllamaTui, "notify") as notify:
+                await self.say(pilot, "one")
+                await self.settle(pilot)
+                notify.assert_not_called()
+
+    async def open_chat_with_model(self, pilot, model):
+        chat_id = self.store.create_chat("old chat", model, None, 0.7)
+        self.store.add_messages(chat_id, [{"role": "user", "content": "hi"},
+                                          {"role": "assistant", "content": "hello"}])
+        await self.app._load_chat(chat_id)
+        await pilot.pause()
+        return chat_id
+
+    async def test_missing_model_on_load_offers_pull_switch_or_keep(self):
+        async with self.app.run_test(size=(120, 40)) as pilot:
+            await self.settle(pilot)
+            await self.open_chat_with_model(pilot, "gone:1")
+            self.assertIsInstance(self.app.screen, ChoiceScreen)
+            self.assertEqual([v for _, v in self.app.screen.choices], ["pull", "switch", "keep"])
+            self.assertEqual(self.log_texts(), ["hi", "hello"])  # history is shown regardless
+
+    async def test_missing_model_pull_choice(self):
+        async with self.app.run_test(size=(120, 40)) as pilot:
+            await self.settle(pilot)
+            await self.open_chat_with_model(pilot, "gone:1")
+            self.app.screen.query_one("#choice-0").press()
+            await pilot.pause()
+            await self.settle(pilot)
+            pulls = [body["model"] for path, body in self.server.requests if path == "/api/pull"]
+            self.assertEqual(pulls, ["gone:1"])
+            self.assertIn("gone:1", self.app.model_names)
+            self.assertEqual(self.app.model, "gone:1")
+
+    async def test_missing_model_switch_choice_keeps_chat_and_saves_model(self):
+        async with self.app.run_test(size=(120, 40)) as pilot:
+            await self.settle(pilot)
+            chat_id = await self.open_chat_with_model(pilot, "gone:1")
+            self.app.screen.query_one("#choice-1").press()
+            await pilot.pause()
+            self.assertEqual(self.app.model, "fake:1")
+            self.assertEqual(self.store.get_chat(chat_id)["model"], "fake:1")
+            await self.say(pilot, "next")
+            self.assertEqual(self.server.requests[-1][1]["model"], "fake:1")
+
+    async def test_missing_model_keep_choice_changes_nothing(self):
+        async with self.app.run_test(size=(120, 40)) as pilot:
+            await self.settle(pilot)
+            await self.open_chat_with_model(pilot, "gone:1")
+            await pilot.press("escape")
+            await pilot.pause()
+            self.assertEqual(self.app.model, "gone:1")
+            self.assertFalse([r for r in self.server.requests if r[0] == "/api/pull"])
+
+    async def test_installed_model_on_load_shows_no_dialog(self):
+        async with self.app.run_test(size=(120, 40)) as pilot:
+            await self.settle(pilot)
+            await self.open_chat_with_model(pilot, "nomic-embed-text:latest")
+            self.assertNotIsInstance(self.app.screen, ChoiceScreen)
 
     async def test_history_is_sent_with_follow_up(self):
         async with self.app.run_test(size=(120, 40)) as pilot:

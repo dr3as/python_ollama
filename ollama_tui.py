@@ -145,6 +145,17 @@ class ChatStore:
             self._db.execute("DELETE FROM chats WHERE id = ?", (chat_id,))
 
 
+CONTEXT_WARN_PERCENT = 80
+CONTEXT_FULL_PERCENT = 100
+
+
+def context_percent(last: Optional[Dict[str, Any]], context_total: Optional[int]) -> Optional[int]:
+    """How full the context window is (approximate, see format_stats), or None if unknown."""
+    if last is None or not context_total:
+        return None
+    return (last["prompt_tokens"] + last["reply_tokens"]) * 100 // context_total
+
+
 def format_stats(last: Optional[Dict[str, Any]], context_total: Optional[int],
                  session_tokens: int, live: Optional[tuple] = None) -> str:
     """One line of numbers for the status bar. live is (chunks so far, seconds) while streaming."""
@@ -158,7 +169,9 @@ def format_stats(last: Optional[Dict[str, Any]], context_total: Optional[int],
     # conversation when part of it was cached), so the context figure is approximate.
     used = last["prompt_tokens"] + last["reply_tokens"]
     if context_total:
-        context = f"ctx ~{used:,}/{context_total:,} ({used * 100 // context_total}%)"
+        percent = used * 100 // context_total
+        warning = " ⚠" if percent >= CONTEXT_WARN_PERCENT else ""
+        context = f"ctx ~{used:,}/{context_total:,} ({percent}%){warning}"
     else:
         context = f"ctx ~{used:,}"
     parts = [
@@ -328,6 +341,20 @@ class CommandSuggester(Suggester):
         return None
 
 
+class PromptInput(Input):
+    """The message box. Tab accepts the suggestion; with nothing to complete it moves focus on."""
+
+    BINDINGS = [Binding("tab", "complete", "Complete", show=False)]
+
+    async def action_complete(self) -> None:
+        suggestion = await self.suggester.get_suggestion(self.value) if self.suggester else None
+        if suggestion and suggestion != self.value:
+            self.value = suggestion
+            self.cursor_position = len(suggestion)
+        else:
+            self.screen.focus_next()
+
+
 class KeyedItem(ListItem):
     """A list row that remembers the model name or chat id it stands for."""
 
@@ -354,6 +381,31 @@ class UserMessage(Static):
     def __init__(self, text: str, **kwargs):
         super().__init__(Text(text), **kwargs)
         self.text = text
+
+
+class ChoiceScreen(ModalScreen[Optional[str]]):
+    """A question with one button per choice. Esc dismisses with None."""
+
+    BINDINGS = [Binding("escape", "dismiss_none", "Cancel")]
+
+    def __init__(self, question: str, choices: List[tuple]):
+        super().__init__()
+        self.question = question
+        self.choices = choices  # (label, value) pairs
+
+    def compose(self) -> ComposeResult:
+        with Vertical(classes="dialog"):
+            yield Label(self.question)
+            with Vertical(classes="choices"):
+                for index, (label, _) in enumerate(self.choices):
+                    yield Button(label, id=f"choice-{index}")
+
+    @on(Button.Pressed)
+    def _pressed(self, event: Button.Pressed) -> None:
+        self.dismiss(self.choices[int(event.button.id.split("-")[1])][1])
+
+    def action_dismiss_none(self) -> None:
+        self.dismiss(None)
 
 
 class InfoScreen(ModalScreen[None]):
@@ -440,7 +492,9 @@ class OllamaTui(App):
     .field-label { margin-top: 1; }
     .dialog { width: 70; max-width: 90%; height: auto; max-height: 90%; padding: 1 2;
               border: thick $primary; background: $surface; }
-    InfoScreen, ConfirmScreen { align: center middle; }
+    InfoScreen, ConfirmScreen, ChoiceScreen { align: center middle; }
+    .choices { height: auto; margin-top: 1; }
+    .choices Button { width: 100%; margin-bottom: 1; }
     .dialog-title { text-style: bold; margin-bottom: 1; }
     .dialog .buttons { height: auto; margin-top: 1; }
     """
@@ -464,6 +518,8 @@ class OllamaTui(App):
         self.busy = False
         self._cancel = threading.Event()
         self.context_total: Optional[int] = None  # context window of the loaded model, from /api/ps
+        self._context_warned = 0  # highest context warning level already shown for this chat
+        self.models_loaded = False  # True once the installed-model list has been fetched
         self.session_tokens = 0  # reply tokens received since the app started
         self._live: Optional[tuple] = None  # (chunks, seconds) while a reply streams in
         self.status_text = ""  # what the status bar shows (also read by the tests)
@@ -512,7 +568,7 @@ class OllamaTui(App):
                 with VerticalScroll(id="log"):
                     yield Static(self._welcome_text(), id="welcome")
                 yield Static("", id="status")
-                yield Input(
+                yield PromptInput(
                     placeholder="Message, or /help for commands",
                     id="prompt",
                     suggester=CommandSuggester(COMMAND_NAMES, lambda: self.model_names),
@@ -522,7 +578,7 @@ class OllamaTui(App):
     @staticmethod
     def _welcome_text() -> str:
         return ("Type a message and press Enter. Commands start with / (try /help).\n"
-                "Ctrl+B hides the side panel, Esc stops a running reply, → accepts a suggestion.")
+                "Ctrl+B hides the side panel, Esc stops a running reply, Tab accepts a suggestion.")
 
     def on_mount(self) -> None:
         if self.size.width < 100:
@@ -550,6 +606,7 @@ class OllamaTui(App):
         """Forget per-conversation numbers (new chat, loaded chat or another model)."""
         self.session.last_stats = None
         self.context_total = None
+        self._context_warned = 0
         self._live = None
 
     def _set_busy(self, busy: bool) -> None:
@@ -599,7 +656,7 @@ class OllamaTui(App):
         width = max(len(c) for c in COMMANDS)
         body = "\n".join(f"{cmd.ljust(width)}  {text}" for cmd, text in COMMANDS.items())
         body += ("\n\nCtrl+B  side panel    Ctrl+N  new chat    Esc  stop reply"
-                 "\n→  accept the suggestion shown in the input    Ctrl+Q  quit")
+                 "\nTab or →  accept the suggestion shown in the input    Ctrl+Q  quit")
         self.push_screen(InfoScreen("Commands", body))
 
     # ---- chat log -----------------------------------------------------------------------------
@@ -698,6 +755,23 @@ class OllamaTui(App):
         if model == self.model and total:
             self.context_total = total
             self._update_status()
+            self._warn_if_context_full()
+
+    def _warn_if_context_full(self) -> None:
+        """Tell the user once per level (80%, 100%) before the model starts forgetting the start."""
+        percent = context_percent(self.session.last_stats, self.context_total)
+        if percent is None:
+            return
+        if percent >= CONTEXT_FULL_PERCENT and self._context_warned < 2:
+            self._context_warned = 2
+            self.notify("The context window is full. Ollama now drops the oldest messages, so the "
+                        "model forgets the start of this chat. Use /new to start a fresh one.",
+                        title="Context full", severity="error", timeout=12)
+        elif percent >= CONTEXT_WARN_PERCENT and self._context_warned < 1:
+            self._context_warned = 1
+            self.notify(f"The context window is about {percent}% full. Very long chats make the "
+                        "model forget the beginning; consider /new.",
+                        title="Context filling up", severity="warning", timeout=10)
 
     def _save_exchange(self, user_text: str, reply: str) -> None:
         if self.chat_id is None:
@@ -865,6 +939,7 @@ class OllamaTui(App):
 
     async def _models_loaded(self, names: List[str], select_first: bool) -> None:
         self.model_names = names
+        self.models_loaded = True
         if select_first and names and not self.model:
             self._set_model(names[0])
         elif select_first and not names:
@@ -991,6 +1066,7 @@ class OllamaTui(App):
             self.notify("That chat no longer exists.", severity="warning")
             self._refresh_chats()
             return
+        previous_model = self.model
         self.chat_id = chat_id
         self.model = chat["model"] or self.model
         self.session = ChatSession(self.client, model=self.model, system=chat["system"],
@@ -1002,6 +1078,25 @@ class OllamaTui(App):
         await self._render_messages(chat["messages"])
         self._update_status()
         self.main_screen.query_one("#prompt").focus()
+        if self.models_loaded and chat["model"] and chat["model"] not in self.model_names:
+            self._ask_about_missing_model(chat["model"], previous_model)
+
+    def _ask_about_missing_model(self, missing: str, previous: Optional[str]) -> None:
+        """The chat was made with a model that is no longer installed: offer pull or switch."""
+        choices = [(f"Pull {missing}", "pull")]
+        fallback = previous if previous in self.model_names else (self.model_names or [None])[0]
+        if fallback:
+            choices.append((f"Switch to {fallback}", "switch"))
+        choices.append(("Keep it (replies will fail until it is installed)", "keep"))
+
+        def answered(choice: Optional[str]) -> None:
+            if choice == "pull":
+                self._pull(missing)
+            elif choice == "switch" and fallback and self.model == missing:
+                self._set_model(fallback)
+
+        self.push_screen(ChoiceScreen(f"This chat used {missing}, which is not installed.", choices),
+                         answered)
 
     @on(Button.Pressed, "#new-chat")
     async def _new_pressed(self) -> None:

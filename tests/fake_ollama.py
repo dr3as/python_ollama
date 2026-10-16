@@ -29,6 +29,7 @@ class FakeOllama:
         self.models = list(models)
         self.requests = []
         self.fail_next = 0
+        self.context_length = 4096
         self.running = [self.models[0]] if self.models else []
         self.slow_seconds = 1.0
         outer = self
@@ -55,7 +56,7 @@ class FakeOllama:
                 if self.path == "/api/ps":
                     return self._json({"models": [
                         {"model": m, "name": m, "size": 4_000_000_000, "size_vram": 3_000_000_000,
-                         "context_length": 4096,
+                         "context_length": outer.context_length,
                          "expires_at": (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()}
                         for m in outer.running
                     ]})
