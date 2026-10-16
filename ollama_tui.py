@@ -1,6 +1,27 @@
 """Full-screen terminal chat for Ollama, built on Textual.
 
 Run with `python3 ollama_tui.py`. Chats are saved automatically in a SQLite database.
+
+How the file is organised, top to bottom:
+
+1. Small helpers that need no UI (path, time, error text).
+2. ChatStore: saving chats in SQLite.
+3. Pure formatting/reading functions for the status bar and Resources tab (format_stats,
+   format_resources, read_gpus, ...). They take plain data and return plain data, which makes
+   them easy to test without starting the app.
+4. Small widgets and dialogs (PromptArea, AssistantMessage, ChoiceScreen, ...).
+5. OllamaTui: the application itself.
+6. build_parser() and main(): the command line entry point.
+
+The one idea to understand before reading OllamaTui is the THREADING MODEL:
+
+* Textual runs the user interface on one thread, in an asyncio event loop. Anything slow that
+  runs there freezes the whole screen.
+* The Ollama calls are slow and blocking (a reply takes seconds). So they run in *thread
+  workers*: methods decorated with `@work(thread=True)`.
+* A worker thread must never touch widgets directly. It hands the result back with
+  `self.call_from_thread(function, *args)`, which runs `function` on the UI thread.
+* ChatStore (SQLite) is only used from the UI thread, so it needs no locking.
 """
 import argparse
 import ipaddress
@@ -31,6 +52,8 @@ from textual.widgets import (
     Markdown, ProgressBar, Static, TabbedContent, TabPane, TextArea,
 )
 
+# psutil is optional. Importing it in a try block lets the app start without it; code that needs
+# it checks `psutil is None` (see read_host_stats).
 try:
     import psutil  # optional: CPU and RAM of this machine
 except ImportError:
@@ -41,22 +64,27 @@ from ollama_client import (
 )
 
 APP_NAME = "ollama_tui"
-TITLE_LENGTH = 50
+TITLE_LENGTH = 50  # chat titles (taken from the first message) are cut to this many characters
 
 
 def default_db_path() -> Path:
+    """Where chats are stored, following the XDG convention (~/.local/share/<app>/ by default)."""
     data_home = os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local" / "share")
     return Path(data_home) / APP_NAME / "chats.db"
 
 
 def _now() -> str:
+    # UTC and a fixed format: such timestamps sort correctly as plain text, which the
+    # ORDER BY in ChatStore.list_chats relies on.
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def _describe(error: Exception) -> str:
+    """Turn an exception into one short line a user can act on."""
     if isinstance(error, ollama.ResponseError):
         return f"Ollama error: {error.error or error}"
     if isinstance(error, (ConnectionError, httpx.TransportError)):
+        # Some httpx errors (timeouts) have an empty message, so fall back to the class name.
         return f"Cannot reach Ollama: {error or type(error).__name__}"
     return str(error) or type(error).__name__
 
@@ -64,12 +92,20 @@ def _describe(error: Exception) -> str:
 class ChatStore:
     """Saves chats and their messages in SQLite. Use it from one thread only (the UI thread)."""
 
+    # Two tables: `chats` (one row per conversation, with its settings) and `messages` (many
+    # rows per chat). A SQLite connection may only be used by the thread that created it,
+    # which is why only the UI thread talks to the store.
+
     def __init__(self, path):
+        # ":memory:" is SQLite's name for a throw-away database, used by the tests.
         if str(path) != ":memory:":
             Path(path).parent.mkdir(parents=True, exist_ok=True)
         self._db = sqlite3.connect(str(path))
-        self._db.row_factory = sqlite3.Row
+        self._db.row_factory = sqlite3.Row  # rows can be read by column name: row["title"]
+        # SQLite ignores foreign keys unless asked, per connection. Without this, the
+        # ON DELETE CASCADE below would silently do nothing and leave orphaned messages.
         self._db.execute("PRAGMA foreign_keys = ON")
+        # IF NOT EXISTS makes this safe to run on every start: it only creates what is missing.
         self._db.executescript("""
             CREATE TABLE IF NOT EXISTS chats (
                 id INTEGER PRIMARY KEY,
@@ -95,8 +131,13 @@ class ChatStore:
 
     def create_chat(self, title: str, model: Optional[str], system: Optional[str],
                     temperature: float) -> int:
+        """Insert a new chat and return its id."""
         now = _now()
+        # `with self._db:` is a transaction: it commits when the block ends normally and rolls
+        # back if an exception escapes, so a failure never leaves half-written data.
         with self._db:
+            # Values are passed separately as `?` placeholders, never pasted into the SQL
+            # text. That is what prevents SQL injection.
             cur = self._db.execute(
                 "INSERT INTO chats (title, model, system, temperature, created_at, updated_at)"
                 " VALUES (?, ?, ?, ?, ?, ?)",
@@ -105,12 +146,14 @@ class ChatStore:
         return cur.lastrowid
 
     def list_chats(self) -> List[Dict[str, Any]]:
+        """All chats, most recently used first (the id breaks ties for chats in the same second)."""
         rows = self._db.execute(
             "SELECT id, title, model, updated_at FROM chats ORDER BY updated_at DESC, id DESC"
         )
         return [dict(r) for r in rows]
 
     def get_chat(self, chat_id: int) -> Optional[Dict[str, Any]]:
+        """One chat with its messages in order, or None if it does not exist."""
         row = self._db.execute("SELECT * FROM chats WHERE id = ?", (chat_id,)).fetchone()
         if row is None:
             return None
@@ -124,7 +167,9 @@ class ChatStore:
         return chat
 
     def add_messages(self, chat_id: int, messages: List[Dict[str, str]]) -> None:
+        """Append messages to a chat and mark the chat as just used."""
         now = _now()
+        # Both statements share one transaction: either both happen or neither does.
         with self._db:
             self._db.executemany(
                 "INSERT INTO messages (chat_id, role, content, created_at) VALUES (?, ?, ?, ?)",
@@ -133,18 +178,24 @@ class ChatStore:
             self._db.execute("UPDATE chats SET updated_at = ? WHERE id = ?", (now, chat_id))
 
     def update_chat(self, chat_id: int, **fields) -> None:
+        """Change some columns of a chat, e.g. update_chat(3, title="New", temperature=0.2)."""
         allowed = {"title", "model", "system", "temperature"}
-        if not fields or not set(fields) <= allowed:
+        if not fields or not set(fields) <= allowed:  # `<=` on sets means "is a subset of"
             raise ValueError(f"can only update {sorted(allowed)}")
+        # Column names cannot be `?` placeholders, so they ARE pasted into the SQL. That is safe
+        # only because the check above restricts them to the fixed allow-list.
         assignments = ", ".join(f"{name} = ?" for name in fields)
         with self._db:
             self._db.execute(f"UPDATE chats SET {assignments} WHERE id = ?",
                              (*fields.values(), chat_id))
 
     def delete_chat(self, chat_id: int) -> None:
+        """Delete a chat; its messages go too (ON DELETE CASCADE)."""
         with self._db:
             self._db.execute("DELETE FROM chats WHERE id = ?", (chat_id,))
 
+
+# ---- status bar and Resources tab: plain functions ------------------------------------------------
 
 CONTEXT_WARN_PERCENT = 80
 CONTEXT_FULL_PERCENT = 100
@@ -163,14 +214,14 @@ def format_stats(last: Optional[Dict[str, Any]], context_total: Optional[int],
     if live is not None:
         chunks, seconds = live
         speed = f" · ~{chunks / seconds:.1f} tok/s" if seconds > 0 else ""
-        return f"receiving: ~{chunks:,} tokens{speed}"
+        return f"receiving: ~{chunks:,} tokens{speed}"  # `:,` adds thousands separators
     if last is None:
         return "no replies yet"
     # prompt_tokens is what Ollama evaluated for this request (it can be lower than the whole
     # conversation when part of it was cached), so the context figure is approximate.
     used = last["prompt_tokens"] + last["reply_tokens"]
     if context_total:
-        percent = used * 100 // context_total
+        percent = used * 100 // context_total  # `//` is integer division
         warning = " ⚠" if percent >= CONTEXT_WARN_PERCENT else ""
         context = f"ctx ~{used:,}/{context_total:,} ({percent}%){warning}"
     else:
@@ -180,7 +231,7 @@ def format_stats(last: Optional[Dict[str, Any]], context_total: Optional[int],
         f"{last['tokens_per_second']:.1f} tok/s",
         f"last {last['prompt_tokens']:,} in / {last['reply_tokens']:,} out",
     ]
-    if last["load_seconds"] >= 0.5:
+    if last["load_seconds"] >= 0.5:  # only mention loading when the model really had to load
         parts.append(f"load {last['load_seconds']:.1f}s")
     parts.append(f"session {session_tokens:,} out")
     return " · ".join(parts)
@@ -191,14 +242,16 @@ NVIDIA_SMI_QUERY = "name,utilization.gpu,memory.used,memory.total,temperature.gp
 
 def is_local_host(url: str) -> bool:
     """True when the Ollama URL points at this machine, so local CPU/RAM/GPU numbers apply."""
+    # urlparse only finds the host when the text starts with "//", so add that to bare names
+    # such as "localhost:11434".
     host = urlparse(url if "//" in url else f"//{url}").hostname or ""
     if host in ("localhost", socket.gethostname()):
         return True
     try:
         address = ipaddress.ip_address(host)
-    except ValueError:
+    except ValueError:  # not an IP address (a hostname we do not recognise): treat as remote
         return False
-    return address.is_loopback or address.is_unspecified
+    return address.is_loopback or address.is_unspecified  # 127.x.x.x, ::1, 0.0.0.0
 
 
 def read_host_stats() -> Optional[Dict[str, float]]:
@@ -206,6 +259,8 @@ def read_host_stats() -> Optional[Dict[str, float]]:
     if psutil is None:
         return None
     memory = psutil.virtual_memory()
+    # cpu_percent() reports usage since its previous call, which is why on_mount calls it once
+    # to prime it.
     return {"cpu_percent": psutil.cpu_percent(), "ram_used": memory.used, "ram_total": memory.total}
 
 
@@ -218,14 +273,15 @@ def parse_nvidia_smi(output: str) -> List[Dict[str, Any]]:
             return None  # e.g. "[N/A]"
 
     gpus = []
-    for line in output.strip().splitlines():
+    for line in output.strip().splitlines():  # one line per GPU
         fields = [f.strip() for f in line.split(",")]
-        if len(fields) != 5:
+        if len(fields) != 5:  # skip lines that do not match the query we asked for
             continue
         used, total = number(fields[2]), number(fields[3])
         gpus.append({
             "name": fields[0],
             "util_percent": number(fields[1]),
+            # nvidia-smi reports MiB; convert to bytes (2**20 = 1,048,576) like the rest of the app.
             "vram_used": used * 2**20 if used is not None else None,
             "vram_total": total * 2**20 if total is not None else None,
             "temperature": number(fields[4]),
@@ -235,30 +291,36 @@ def parse_nvidia_smi(output: str) -> List[Dict[str, Any]]:
 
 def read_gpus() -> Optional[List[Dict[str, Any]]]:
     """NVIDIA GPUs of this machine, or None when nvidia-smi is missing or fails."""
-    if shutil.which("nvidia-smi") is None:
+    if shutil.which("nvidia-smi") is None:  # `which` returns None when the program is not installed
         return None
     try:
+        # A list of arguments (not one string) avoids going through a shell. The timeout stops
+        # a hung driver from freezing the refresh; check=True turns a non-zero exit code into
+        # an exception.
         result = subprocess.run(
             ["nvidia-smi", f"--query-gpu={NVIDIA_SMI_QUERY}", "--format=csv,noheader,nounits"],
             capture_output=True, text=True, timeout=3, check=True,
         )
     except (OSError, subprocess.SubprocessError):
         return None
-    return parse_nvidia_smi(result.stdout) or None
+    return parse_nvidia_smi(result.stdout) or None  # an empty list also means "no GPU data"
 
 
 def format_bytes(size: float) -> str:
+    """5_200_000_000 -> "5.2 GB"; small sizes are shown in MB."""
     return f"{size / 1e9:.1f} GB" if size >= 1e8 else f"{size / 1e6:.0f} MB"
 
 
 def _bar(percent: Optional[float], width: int = 10) -> str:
+    """A text meter such as "███░░░░░░░" for 30%."""
     if percent is None:
         return "?" * width
-    filled = round(max(0, min(100, percent)) / 100 * width)
+    filled = round(max(0, min(100, percent)) / 100 * width)  # clamp to 0-100 first
     return "█" * filled + "░" * (width - filled)
 
 
 def _expires_in(expires_at: Optional[datetime]) -> str:
+    """"unloads in 4m" for a model Ollama will unload when idle."""
     if expires_at is None:
         return ""
     seconds = int((expires_at - datetime.now(timezone.utc)).total_seconds())
@@ -281,6 +343,7 @@ def format_resources(loaded: Optional[List[Dict[str, Any]]], error: Optional[str
         if size and in_vram >= size:
             where = "100% GPU"
         elif size:
+            # Part of the model did not fit in GPU memory and runs on the CPU: much slower.
             gpu = in_vram * 100 // size
             where = f"{gpu}% GPU / {100 - gpu}% CPU ⚠"
         else:
@@ -288,9 +351,11 @@ def format_resources(loaded: Optional[List[Dict[str, Any]]], error: Optional[str
         lines.append(f"    {format_bytes(size)} · {where}")
         extra = [f"ctx {m['context_length']:,}"] if m.get("context_length") else []
         extra.append(_expires_in(m.get("expires_at")))
-        lines.append("    " + " · ".join(e for e in extra if e))
+        lines.append("    " + " · ".join(e for e in extra if e))  # `if e` drops empty parts
     lines.append("")
 
+    # A remote Ollama cannot tell us about its host's CPU, RAM or GPU, so say so instead of
+    # showing numbers about the wrong machine.
     if not local:
         lines += ["THIS MACHINE", "  CPU, RAM and GPU load are only",
                   "  shown when Ollama runs on this",
@@ -322,6 +387,9 @@ def format_resources(loaded: Optional[List[Dict[str, Any]]], error: Optional[str
     return "\n".join(lines)
 
 
+# ---- widgets and dialogs -------------------------------------------------------------------------
+
+
 class CommandSuggester(Suggester):
     """Completes slash commands, and model names after /model, /show, /delete and /pull."""
 
@@ -331,12 +399,14 @@ class CommandSuggester(Suggester):
         self.models = models  # callable returning the current model names
 
     async def get_suggestion(self, value: str) -> Optional[str]:
+        """Return the full text the input should become, or None. Textual calls this as you type."""
         if not value.startswith("/"):
             return None
-        command, space, rest = value.partition(" ")
-        if not space:
+        command, space, rest = value.partition(" ")  # "/model nom" -> ("/model", " ", "nom")
+        if not space:  # still typing the command name itself
             return next((c for c in self.commands if c.startswith(command.lower()) and c != command), None)
         if command.lower() in ("/model", "/show", "/delete") and rest:
+            # next(generator, None) takes the first match, or None when there is none.
             return next((f"{command} {m}" for m in self.models()
                          if m.lower().startswith(rest.lower()) and m != rest), None)
         return None
@@ -353,6 +423,7 @@ class PromptArea(TextArea):
     """
 
     MAX_ROWS = 8
+    # Key bindings map a key to an *action*: "submit" runs the method action_submit().
     BINDINGS = [
         # Priority, because TextArea itself would turn Enter into a newline and Tab into an indent.
         Binding("enter", "submit", "Send", show=False, priority=True),
@@ -362,6 +433,8 @@ class PromptArea(TextArea):
     ]
 
     class Submitted(Message):
+        """Posted when the user presses Enter. The app handles it with @on(PromptArea.Submitted)."""
+
         def __init__(self, text: str):
             super().__init__()
             self.text = text
@@ -372,6 +445,8 @@ class PromptArea(TextArea):
         self.hint_text = HINT_DEFAULT  # what the hint line shows (also read by the tests)
 
     def action_submit(self) -> None:
+        # The widget does not send anything itself. It announces "the user submitted this" as a
+        # message, and the app decides what that means (a command or a chat message).
         self.post_message(self.Submitted(self.text))
 
     def action_newline(self) -> None:
@@ -380,7 +455,7 @@ class PromptArea(TextArea):
     async def _suggestion(self) -> Optional[str]:
         """A completion for a one-line /command, or None."""
         text = self.text
-        if not text or "\n" in text:
+        if not text or "\n" in text:  # multi-line text is a message, never a command
             return None
         suggestion = await self.suggester.get_suggestion(text)
         return suggestion if suggestion and suggestion != text else None
@@ -391,13 +466,17 @@ class PromptArea(TextArea):
             self.load_text(suggestion)
             self.move_cursor(self.document.end)
         else:
-            self.screen.focus_next()
+            self.screen.focus_next()  # nothing to complete: Tab behaves like it normally does
 
     def _rows(self) -> int:
+        """How many text rows the box needs, counting lines that wrap, capped at MAX_ROWS."""
         width = max(self.size.width - 4, 20)  # minus border and padding
+        # -(-a // b) is "round up" integer division (ceiling) without importing math.
         rows = sum(max(1, -(-len(line) // width)) for line in self.text.split("\n"))
         return min(rows, self.MAX_ROWS)
 
+    # Textual finds handlers by name: a message class TextArea.Changed is handled by a method
+    # called on_text_area_changed (class name in snake_case, prefixed with "on_").
     async def on_text_area_changed(self) -> None:
         self.styles.height = self._rows() + 2  # plus the border
         suggestion = await self._suggestion()
@@ -421,6 +500,8 @@ class AssistantMessage(Markdown):
         self.text = text
 
     def update(self, markdown: str):
+        # Override only to record the text, then let Markdown do the real work. The return value
+        # is passed on because update() returns something that callers `await`.
         self.text = markdown
         return super().update(markdown)
 
@@ -429,8 +510,14 @@ class UserMessage(Static):
     """A plain-text message that remembers its text."""
 
     def __init__(self, text: str, **kwargs):
+        # Text(...) from rich shows the string literally. Passing a plain str would make Textual
+        # read things like "[bold]" in a user's message as formatting markup.
         super().__init__(Text(text), **kwargs)
         self.text = text
+
+
+# A ModalScreen is a dialog drawn on top of the app that blocks the screen below it. The type in
+# brackets, ModalScreen[bool], is what the dialog "returns" via self.dismiss(value).
 
 
 class ChoiceScreen(ModalScreen[Optional[str]]):
@@ -452,6 +539,7 @@ class ChoiceScreen(ModalScreen[Optional[str]]):
 
     @on(Button.Pressed)
     def _pressed(self, event: Button.Pressed) -> None:
+        # The button id is "choice-<index>"; the index picks the matching (label, value) pair.
         self.dismiss(self.choices[int(event.button.id.split("-")[1])][1])
 
     def action_dismiss_none(self) -> None:
@@ -459,6 +547,8 @@ class ChoiceScreen(ModalScreen[Optional[str]]):
 
 
 class InfoScreen(ModalScreen[None]):
+    """A read-only dialog with a title and some text (used by /help and model info)."""
+
     BINDINGS = [Binding("escape,enter,q", "dismiss_screen", "Close")]
 
     def __init__(self, title: str, body: str):
@@ -481,6 +571,8 @@ class InfoScreen(ModalScreen[None]):
 
 
 class ConfirmScreen(ModalScreen[bool]):
+    """A yes/no question. Dismisses with True for Yes, False for No or Esc."""
+
     BINDINGS = [Binding("escape,n", "answer(False)", "No"), Binding("y", "answer(True)", "Yes")]
 
     def __init__(self, question: str):
@@ -499,6 +591,7 @@ class ConfirmScreen(ModalScreen[bool]):
         self.dismiss(event.button.id == "yes")
 
     def action_answer(self, answer: bool) -> None:
+        # Bindings can pass arguments: "answer(True)" above calls action_answer(True).
         self.dismiss(answer)
 
 
@@ -514,12 +607,32 @@ COMMANDS = {
     "/rename title": "rename the current chat",
     "/quit": "exit",
 }
+# "/model [name]" -> "/model": keep only the first word, deduplicate with a set, then sort.
 COMMAND_NAMES = sorted({c.split()[0] for c in COMMANDS})
 
 
+# ---- the application -----------------------------------------------------------------------------
+
+
 class OllamaTui(App):
+    """The chat application: a side panel with tabs, the conversation, a status bar and a prompt.
+
+    Rough map of the methods below (they appear in this order):
+      layout              compose(), on_mount()
+      status bar          _update_status() and friends
+      chat                _submit_message() -> _stream_reply() (thread) -> _reply_finished()
+      commands            _run_command() and the _apply_*/_cmd_* helpers
+      Resources tab       _poll_resources() -> _read_resources() (thread) -> _show_resources()
+      models tab          _load_models(), _pull(), _show(), _delete_model()
+      chats tab           _load_chat(), _refresh_chats()
+    """
+
     TITLE = "Ollama"
 
+    # Textual styles widgets with CSS-like rules. A few things worth knowing:
+    #   #name   selects the widget with that id        .name  selects widgets with that class
+    #   1fr     "one fraction": take the remaining space      $primary  a colour from the theme
+    # The sidebar is hidden by adding the "hidden" class, which sets display: none.
     CSS = """
     #body { height: 1fr; }
     #sidebar { width: 40; border-right: solid $primary; }
@@ -565,8 +678,10 @@ class OllamaTui(App):
         self.model = model
         self.model_names: List[str] = []
         self.session = ChatSession(client)
-        self.chat_id: Optional[int] = None
-        self.busy = False
+        self.chat_id: Optional[int] = None  # None until the first reply is saved
+        self.busy = False  # True while a reply is streaming in
+        # A threading.Event is a flag that is safe to share between threads. The UI thread sets it
+        # (Esc) and the streaming thread checks it between chunks.
         self._cancel = threading.Event()
         self.context_total: Optional[int] = None  # context window of the loaded model, from /api/ps
         self._context_warned = 0  # highest context warning level already shown for this chat
@@ -576,8 +691,8 @@ class OllamaTui(App):
         self.status_text = ""  # what the status bar shows (also read by the tests)
         self.is_local = is_local_host(client.base_url)
         self.resources_text = ""  # what the Resources tab shows (also read by the tests)
-        self._polling = False
-        self.sub_title = host_label or client.base_url
+        self._polling = False  # True while a Resources refresh is running
+        self.sub_title = host_label or client.base_url  # shown by the Header widget
 
     # ---- layout -------------------------------------------------------------------------
 
@@ -588,6 +703,7 @@ class OllamaTui(App):
         return self.screen_stack[0]
 
     def compose(self) -> ComposeResult:
+        """Build the widget tree. `with` nests widgets inside a container; `yield` adds one."""
         yield Header()
         with Horizontal(id="body"):
             with Vertical(id="sidebar"):
@@ -620,6 +736,8 @@ class OllamaTui(App):
                     yield Static(self._welcome_text(), id="welcome")
                 yield Static("", id="status")
                 yield Static(Text(HINT_DEFAULT), id="hint")
+                # The lambda is evaluated each time a suggestion is needed, so the suggester
+                # always sees the *current* model list, not the empty one from startup.
                 yield PromptArea(CommandSuggester(COMMAND_NAMES, lambda: self.model_names), id="prompt")
         yield Footer()
 
@@ -629,7 +747,8 @@ class OllamaTui(App):
                 "Ctrl+B hides the side panel, Esc stops a running reply, Tab completes a command.")
 
     def on_mount(self) -> None:
-        if self.size.width < 100:
+        """Runs once, after the widgets exist. Textual calls on_<event> methods automatically."""
+        if self.size.width < 100:  # a 40-column panel would crowd a narrow terminal
             self.main_screen.query_one("#sidebar").add_class("hidden")
         self.main_screen.query_one("#prompt").focus()
         self._refresh_chats()
@@ -637,11 +756,12 @@ class OllamaTui(App):
         self._update_status()
         if psutil is not None:
             psutil.cpu_percent()  # the first call has no earlier sample to compare with
-        self.set_interval(2.0, self._poll_resources)
+        self.set_interval(2.0, self._poll_resources)  # call it every 2 seconds from now on
 
     # ---- status and small helpers -------------------------------------------------------------
 
     def _update_status(self) -> None:
+        """Redraw the two-line status bar from the current state."""
         state = "generating... (Esc to stop)" if self.busy else "ready"
         system = "set" if self.session.system else "none"
         stats = format_stats(self.session.last_stats, self.context_total,
@@ -673,7 +793,7 @@ class OllamaTui(App):
 
     def _set_model(self, name: str) -> None:
         if name != self.model:
-            self._clear_stats()
+            self._clear_stats()  # the numbers belonged to the previous model
         self.model = name
         self.session.model = name
         if self.chat_id is not None:
@@ -681,6 +801,8 @@ class OllamaTui(App):
         self._update_status()
 
     # ---- actions ------------------------------------------------------------------------------
+    # An "action" is a method named action_<name>. Key bindings (BINDINGS above) and the
+    # self.action_...() calls elsewhere trigger them.
 
     def action_toggle_sidebar(self) -> None:
         self.main_screen.query_one("#sidebar").toggle_class("hidden")
@@ -689,6 +811,7 @@ class OllamaTui(App):
         if not self._guard():
             return
         self.chat_id = None
+        # A fresh session keeps the current settings (system prompt, temperature) but no history.
         self.session = ChatSession(self.client, model=self.model, system=self.session.system,
                                    temperature=self.session.temperature)
         self._clear_stats()
@@ -698,7 +821,7 @@ class OllamaTui(App):
 
     def action_cancel(self) -> None:
         if self.busy:
-            self._cancel.set()
+            self._cancel.set()  # the streaming thread notices this on its next chunk
 
     def action_help(self) -> None:
         width = max(len(c) for c in COMMANDS)
@@ -711,7 +834,9 @@ class OllamaTui(App):
     # ---- chat log -----------------------------------------------------------------------------
 
     async def _render_messages(self, messages: List[Dict[str, str]]) -> None:
+        """Replace the visible conversation with these messages (or the welcome text if none)."""
         log = self.main_screen.query_one("#log", VerticalScroll)
+        # Mounting/removing widgets is asynchronous in Textual, so these calls are awaited.
         await log.remove_children()
         if not messages:
             await log.mount(Static(self._welcome_text(), id="welcome"))
@@ -724,6 +849,7 @@ class OllamaTui(App):
         log.scroll_end(animate=False)
 
     async def _submit_message(self, text: str) -> None:
+        """Show the user's message and an empty reply, then start streaming the answer."""
         if not self._guard():
             return
         if not self.model:
@@ -734,14 +860,18 @@ class OllamaTui(App):
         for welcome in self.main_screen.query("#welcome"):
             await welcome.remove()
         await log.mount(UserMessage(text, classes="msg user"))
-        reply = AssistantMessage("…", classes="msg assistant")
+        reply = AssistantMessage("…", classes="msg assistant")  # placeholder until text arrives
         await log.mount(reply)
         log.scroll_end(animate=False)
         self.session.model = self.model
         self._cancel.clear()
         self._set_busy(True)
-        self._stream_reply(text, reply)
+        self._stream_reply(text, reply)  # returns at once: the work happens in another thread
 
+    # The reply is produced in three steps, on two threads:
+    #   _stream_reply   (worker thread)  reads chunks from Ollama and hands text to the UI
+    #   _show_partial   (UI thread)      paints the text received so far
+    #   _reply_finished (UI thread)      saves the exchange and resets the state
     @work(thread=True, exit_on_error=False)
     def _stream_reply(self, text: str, widget: AssistantMessage) -> None:
         parts: List[str] = []
@@ -749,7 +879,7 @@ class OllamaTui(App):
         stopped = False
         try:
             stream = self.session.send(text, stream=True)
-            started = time.monotonic()
+            started = time.monotonic()  # monotonic: a clock that never jumps backwards
             last_paint = 0.0
             for chunk in stream:
                 if self._cancel.is_set():
@@ -758,12 +888,15 @@ class OllamaTui(App):
                     break
                 parts.append(chunk)
                 now = time.monotonic()
+                # Repainting for every single token would be wasteful; at most ~20 times a second.
                 if now - last_paint >= 0.05:
                     last_paint = now
                     # each streamed chunk is about one token
                     self.call_from_thread(self._show_partial, widget, "".join(parts),
                                           (len(parts), now - started))
         except Exception as e:
+            # exit_on_error=False above means an exception here would not crash the app, but we
+            # still catch it so the error can be shown in the chat.
             error = _describe(e)
         self.call_from_thread(self._reply_finished, widget, text, "".join(parts), error, stopped)
 
@@ -781,6 +914,7 @@ class OllamaTui(App):
         elif stopped:
             await widget.update((reply + "\n\n" if reply else "") + "*(stopped; not kept in history)*")
         else:
+            # Only a complete reply is saved and counted.
             await widget.update(reply)
             self._save_exchange(text, reply)
             if self.session.last_stats:
@@ -801,6 +935,7 @@ class OllamaTui(App):
         self.call_from_thread(self._set_context_total, model, loaded.get(model))
 
     def _set_context_total(self, model: Optional[str], total: Optional[int]) -> None:
+        # The user may have switched model while the request was running; ignore stale answers.
         if model == self.model and total:
             self.context_total = total
             self._update_status()
@@ -811,6 +946,8 @@ class OllamaTui(App):
         percent = context_percent(self.session.last_stats, self.context_total)
         if percent is None:
             return
+        # _context_warned remembers the highest level already shown (0 none, 1 = 80%, 2 = full),
+        # so each warning appears once per chat instead of after every reply.
         if percent >= CONTEXT_FULL_PERCENT and self._context_warned < 2:
             self._context_warned = 2
             self.notify("The context window is full. Ollama now drops the oldest messages, so the "
@@ -823,6 +960,8 @@ class OllamaTui(App):
                         title="Context filling up", severity="warning", timeout=10)
 
     def _save_exchange(self, user_text: str, reply: str) -> None:
+        """Store a finished question/answer pair, creating the chat row on the first one."""
+        # The chat is created only now (not when it was started) so empty chats are never saved.
         if self.chat_id is None:
             self.chat_id = self.store.create_chat(
                 user_text.strip().replace("\n", " ")[:TITLE_LENGTH] or "Chat",
@@ -836,6 +975,8 @@ class OllamaTui(App):
 
     # ---- prompt input and slash commands -------------------------------------------------------
 
+    # @on(MessageClass) registers a method as the handler for that message type. An optional CSS
+    # selector (see the Input.Submitted handlers below) limits it to one widget.
     @on(PromptArea.Submitted)
     async def _prompt_submitted(self, event: PromptArea.Submitted) -> None:
         text = event.text.strip()
@@ -848,6 +989,7 @@ class OllamaTui(App):
             await self._submit_message(text)
 
     async def _run_command(self, line: str) -> None:
+        """Dispatch a slash command such as "/model llama3"."""
         name, _, arg = line.partition(" ")
         name, arg = name.lower(), arg.strip()
         if name == "/help":
@@ -877,6 +1019,7 @@ class OllamaTui(App):
             self.notify(f"Unknown command {name}. Try /help.", severity="warning")
 
     def _has_arg(self, arg: str, usage: str) -> bool:
+        """True if the command got an argument; otherwise show its usage and return False."""
         if not arg:
             self.notify(f"Usage: {usage}", severity="warning")
         return bool(arg)
@@ -887,14 +1030,17 @@ class OllamaTui(App):
             return
         if not self._guard():
             return
+        # Only complain when the list is known: an empty list may just mean "not loaded yet".
         if self.model_names and arg not in self.model_names:
             self.notify(f"{arg} is not installed. Use /pull {arg} to download it.", severity="warning")
             return
         self._set_model(arg)
 
     def _apply_system(self, text: str) -> None:
+        """Set (or clear, with empty text) the system prompt, including in the running history."""
         if not self._guard():
             return
+        # The system prompt is the first message of the history, so replace it there too.
         messages = self.session.messages
         if messages and messages[0]["role"] == "system":
             messages.pop(0)
@@ -913,9 +1059,9 @@ class OllamaTui(App):
             return
         try:
             value = float(text)
-            if not 0 <= value <= 2:
+            if not 0 <= value <= 2:  # chained comparison: 0 <= value and value <= 2
                 raise ValueError
-        except ValueError:
+        except ValueError:  # covers both "not a number" and the range check above
             self.notify("Temperature must be a number between 0 and 2.", severity="warning")
             return
         self.session.temperature = value
@@ -949,10 +1095,12 @@ class OllamaTui(App):
 
     @on(TabbedContent.TabActivated)
     def _tab_activated(self) -> None:
-        self._poll_resources()
+        self._poll_resources()  # refresh at once when the tab is opened, not after up to 2 s
 
     def _poll_resources(self) -> None:
         """Refresh the Resources tab, but only while it is on screen and the last read is done."""
+        # Skipping when hidden saves network calls and nvidia-smi runs; _polling prevents a slow
+        # read from piling up behind the 2-second timer.
         if self._polling or not self._resources_visible():
             return
         self._polling = True
@@ -990,7 +1138,7 @@ class OllamaTui(App):
         self.model_names = names
         self.models_loaded = True
         if select_first and names and not self.model:
-            self._set_model(names[0])
+            self._set_model(names[0])  # no model given on the command line: take the first one
         elif select_first and not names:
             self.notify("No models installed. Use /pull NAME to download one.", severity="warning")
         view = self.main_screen.query_one("#models", ListView)
@@ -1027,6 +1175,7 @@ class OllamaTui(App):
         else:
             self.notify("Select a model first.", severity="warning")
 
+    # Stacked @on decorators: this one handler serves both the Pull button and Enter in the field.
     @on(Button.Pressed, "#pull-model")
     @on(Input.Submitted, "#pull-name")
     def _pull_pressed(self) -> None:
@@ -1035,6 +1184,7 @@ class OllamaTui(App):
             self._pull(field.value.strip())
             field.value = ""
 
+    # group="model-ops" labels the worker. Workers in a group can be listed or cancelled together.
     @work(thread=True, exit_on_error=False, group="model-ops")
     def _show(self, name: str) -> None:
         if not name:
@@ -1052,6 +1202,8 @@ class OllamaTui(App):
         self.call_from_thread(self.push_screen, InfoScreen(name, body))
 
     def _pull(self, name: str) -> None:
+        # Look the widgets up here on the UI thread and pass them in: the worker thread must not
+        # query the widget tree itself.
         self._pull_worker(name, self.main_screen.query_one("#progress", ProgressBar),
                           self.main_screen.query_one("#pull-status", Label))
 
@@ -1062,6 +1214,8 @@ class OllamaTui(App):
         try:
             for p in self.client.pull_model(name):
                 now = time.monotonic()
+                # A pull sends hundreds of progress events; repaint about 10 times a second, but
+                # never skip the final one (completed == total).
                 if now - last_paint < 0.1 and p["completed"] != p["total"]:
                     continue
                 last_paint = now
@@ -1069,14 +1223,15 @@ class OllamaTui(App):
                 self.call_from_thread(bar.update, total=p["total"] or None, progress=p["completed"] or 0)
         except Exception as e:
             self.call_from_thread(self._fail, e)
-        else:
+        else:  # runs only when the loop finished without an exception
             self.call_from_thread(self.notify, f"Pulled {name}")
             self._load_models()
-        finally:
+        finally:  # runs always, so the progress bar is hidden on success AND on failure
             self.call_from_thread(bar.remove_class, "visible")
             self.call_from_thread(label.update, "")
 
     def _confirm_delete_model(self, name: str) -> None:
+        # push_screen(screen, callback): the callback receives whatever the dialog dismissed with.
         def answered(yes: Optional[bool]) -> None:
             if yes:
                 self._delete_model(name)
@@ -1090,7 +1245,7 @@ class OllamaTui(App):
             self.call_from_thread(self._fail, e)
             return
         self.call_from_thread(self.notify, f"Deleted {name}")
-        if self.model == name:
+        if self.model == name:  # the active model is gone, so there is no model to chat with now
             self.model = None
             self.session.model = None
             self.call_from_thread(self._update_status)
@@ -1110,6 +1265,7 @@ class OllamaTui(App):
             await self._load_chat(event.item.key)
 
     async def _load_chat(self, chat_id: int) -> None:
+        """Open a saved chat: restore its settings and history, and show the messages."""
         chat = self.store.get_chat(chat_id)
         if chat is None:
             self.notify("That chat no longer exists.", severity="warning")
@@ -1118,6 +1274,8 @@ class OllamaTui(App):
         previous_model = self.model
         self.chat_id = chat_id
         self.model = chat["model"] or self.model
+        # Rebuild the session from the database. The stored messages are exactly what gets sent
+        # to the model again with the next question.
         self.session = ChatSession(self.client, model=self.model, system=chat["system"],
                                    temperature=chat["temperature"])
         self.session.messages.extend(chat["messages"])
@@ -1141,6 +1299,7 @@ class OllamaTui(App):
         def answered(choice: Optional[str]) -> None:
             if choice == "pull":
                 self._pull(missing)
+            # `self.model == missing` guards against the user having changed model meanwhile.
             elif choice == "switch" and fallback and self.model == missing:
                 self._set_model(fallback)
 
@@ -1163,6 +1322,8 @@ class OllamaTui(App):
             if not yes:
                 return
             self.store.delete_chat(chat_id)
+            # If the open chat was deleted, leave it too, so new messages do not go to a
+            # chat that no longer exists.
             if chat_id == self.chat_id and self._guard():
                 await self.action_new_chat()
             self._refresh_chats()
@@ -1171,6 +1332,7 @@ class OllamaTui(App):
 
 
 def build_parser() -> argparse.ArgumentParser:
+    """Command line options. They mirror ollama_client.py, plus --db for the chat database."""
     parser = argparse.ArgumentParser(description="Full-screen terminal chat for Ollama.")
     parser.add_argument("--host", default=os.environ.get("OLLAMA_HOST", DEFAULT_HOST),
                         help=f"Ollama server URL (env OLLAMA_HOST, default {DEFAULT_HOST})")
@@ -1190,9 +1352,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     client = OllamaClient(args.host, timeout=args.timeout, retries=args.retries)
     store = ChatStore(args.db)
     try:
-        OllamaTui(client, store, model=args.model).run()
+        OllamaTui(client, store, model=args.model).run()  # blocks until the user quits
     finally:
-        store.close()
+        store.close()  # close the database even if the app crashed
     return 0
 
 

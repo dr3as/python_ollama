@@ -1,3 +1,8 @@
+"""Tests for ollama_client.py: the client, chat sessions, retries/timeouts and the CLI.
+
+Run everything with `python3 -m unittest`. Every test talks to a FakeOllama server (see
+tests/fake_ollama.py), never to a real Ollama.
+"""
 import contextlib
 import io
 import json
@@ -16,15 +21,20 @@ from tests.fake_ollama import FakeOllama
 
 def unused_url() -> str:
     """A localhost URL where nothing is listening."""
+    # Ask the OS for a free port, note the number and release it again: for the moment after
+    # that, connecting to it is refused. That is how the "server is down" tests get a dead URL.
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         return f"http://127.0.0.1:{s.getsockname()[1]}"
 
 
 class FakeServerTestCase(unittest.TestCase):
-    def setUp(self):
+    """Base class: every test gets its own fake server and a client pointed at it."""
+
+    def setUp(self):  # unittest runs this before EACH test method
         self.server = FakeOllama().start()
-        self.addCleanup(self.server.stop)
+        self.addCleanup(self.server.stop)  # cleanups run after the test, even if it failed
+        # retry_delay=0.01 keeps the retry tests fast (the real default is 1 second).
         self.client = OllamaClient(self.server.url, default_model="fake:1", retry_delay=0.01)
 
 
@@ -293,8 +303,13 @@ class TestChatSession(FakeServerTestCase):
 
 class TestCli(FakeServerTestCase):
     def run_cli(self, *argv, stdin=None, inputs=None):
+        """Run ollama_client.main() as if typed in a shell; return (exit code, stdout, stderr).
+
+        stdin is the piped text; inputs are the answers to input() calls (for `chat`).
+        """
         out, err = io.StringIO(), io.StringIO()
         stdin = io.StringIO(stdin if stdin is not None else "")
+        # Remove the user's own OLLAMA_* settings so they cannot change the test outcome.
         env = {k: v for k, v in os.environ.items() if k not in ("OLLAMA_HOST", "OLLAMA_MODEL")}
         patches = [
             mock.patch.dict(os.environ, env, clear=True),
@@ -302,6 +317,8 @@ class TestCli(FakeServerTestCase):
         ]
         if inputs is not None:
             patches.append(mock.patch("builtins.input", side_effect=inputs))
+        # ExitStack enters a list of context managers (the patches and redirects) and undoes
+        # them all, in reverse order, when the block ends.
         with contextlib.ExitStack() as stack:
             for p in patches:
                 stack.enter_context(p)
@@ -309,7 +326,7 @@ class TestCli(FakeServerTestCase):
             stack.enter_context(contextlib.redirect_stderr(err))
             try:
                 rc = ollama_client.main(["--host", self.server.url, *argv])
-            except SystemExit as e:
+            except SystemExit as e:  # argparse errors and _resolve_model exit this way
                 rc = e.code
         return rc, out.getvalue(), err.getvalue()
 

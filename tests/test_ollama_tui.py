@@ -1,3 +1,11 @@
+"""Tests for ollama_tui.py.
+
+Three kinds of test live here:
+* plain unit tests of functions and ChatStore (TestChatStore, TestFormatStats, ...);
+* app tests that start the real OllamaTui against a FakeOllama server and drive it like a user
+  (TestTui, TestResourcesTab, ...), using Textual's "pilot";
+* regression tests for bugs we fixed (look for "dialog" in the test names).
+"""
 import asyncio
 import subprocess
 import unittest
@@ -62,12 +70,15 @@ class TestChatStore(unittest.TestCase):
 
 
 class AsyncTestCase(unittest.IsolatedAsyncioTestCase):
+    """Base for tests with `async def test_...` methods (they run inside an asyncio event loop)."""
+
     def _setupAsyncioRunner(self):
         # unittest starts its event loop in debug mode, which slows Textual down about 10x
         # (a test run goes from ~65 s to ~5 s). Override this hook to turn debug mode off.
         self._asyncioRunner = asyncio.Runner(debug=False)
 
 
+# Sample data shared by the formatting tests below. LAST looks like ChatSession.last_stats.
 LAST = {"prompt_tokens": 1200, "reply_tokens": 300, "tokens_per_second": 42.5,
         "load_seconds": 0.1, "total_seconds": 8.0}
 
@@ -226,6 +237,12 @@ class TestFormatResources(unittest.TestCase):
 
 
 class TuiTestCase(AsyncTestCase):
+    """Base for app tests: a fake server, an in-memory database and an OllamaTui, not yet running.
+
+    A test starts the app with `async with self.app.run_test(size=(120, 40)) as pilot:`. The
+    "pilot" presses keys and clicks like a user, and the app runs headless (no real terminal).
+    """
+
     async def asyncSetUp(self):
         self.server = FakeOllama().start()
         self.addCleanup(self.server.stop)
@@ -234,15 +251,21 @@ class TuiTestCase(AsyncTestCase):
         self.app = OllamaTui(OllamaClient(self.server.url, retry_delay=0.01), self.store)
 
     async def settle(self, pilot):
+        """Wait until background work is done and the UI has processed its results."""
+        # Workers run in threads and report back through the event loop, so a test has to wait
+        # for both before it looks at the screen, otherwise it would check too early.
         await self.app.workers.wait_for_complete()
         await pilot.pause()
 
     async def say(self, pilot, text):
+        """Type a message or /command into the prompt, press Enter and wait for the result."""
         self.app.query_one("#prompt", PromptArea).text = text
         await pilot.press("enter")
         await self.settle(pilot)
 
     def log_texts(self):
+        """The text of every message currently shown in the chat log, in order."""
+        # main_screen, not app.query: a dialog may be on top (see the bug fixed in c476a79).
         return [w.text
                 for w in self.app.main_screen.query("#log .msg")]
 
