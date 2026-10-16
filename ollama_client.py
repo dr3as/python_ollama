@@ -6,7 +6,8 @@ How the file is organised, top to bottom:
 2. OllamaClient: a thin wrapper around the official `ollama` package that adds timeouts,
    retries and a few convenience methods (batch_process, model management, ...).
 3. ChatSession: a conversation that remembers its history.
-4. The command line interface: one `_cmd_*` function per sub-command, wired up in
+4. The config file (load_config) that supplies defaults to both command lines.
+5. The command line interface: one `_cmd_*` function per sub-command, wired up in
    build_parser(), and started by main().
 
 The full-screen app in ollama_tui.py builds on OllamaClient and ChatSession.
@@ -17,10 +18,16 @@ import json
 import os
 import sys
 import time
+from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, TypeVar, Union
 
 import httpx
 import ollama
+
+try:
+    import tomllib  # standard library from Python 3.11
+except ImportError:  # Python 3.10: the config file is simply unavailable
+    tomllib = None
 
 DEFAULT_HOST = "http://localhost:11434"
 DEFAULT_MODEL = "llama2"
@@ -418,6 +425,84 @@ class ChatSession:
             self.last_stats = chat_stats(final_chunk)
 
 
+# ---- config file ---------------------------------------------------------------------------------
+#
+# Defaults can live in a TOML file so you do not retype --host and friends. Precedence, highest
+# first: command-line option, environment variable (OLLAMA_HOST / OLLAMA_MODEL), config file,
+# built-in default. Both ollama_client.py and ollama_tui.py read the same file.
+
+# Allowed keys and their types. Anything else is rejected, so a typo like `timout = 30` is
+# reported instead of being silently ignored.
+CONFIG_KEYS = {
+    "host": str,
+    "model": str,
+    "timeout": (int, float),
+    "retries": int,
+    "temperature": (int, float),
+    "system": str,
+    "db": str,  # chat database path (used by the TUI only); ~ is expanded
+}
+
+
+class ConfigError(ValueError):
+    """The config file cannot be read or contains something invalid."""
+
+
+def default_config_path() -> Path:
+    """~/.config/python_ollama/config.toml, following the XDG convention."""
+    config_home = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
+    return Path(config_home) / "python_ollama" / "config.toml"
+
+
+def config_path_from_argv(argv: Optional[List[str]]) -> Optional[Path]:
+    """Find --config in the arguments before the real parsing.
+
+    The config file supplies the *defaults* of the real parser, so it has to be loaded before
+    that parser is built. A tiny parser that only knows --config solves the chicken-and-egg
+    problem; parse_known_args ignores everything else.
+    """
+    pre = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+    pre.add_argument("--config", type=Path)
+    return pre.parse_known_args(argv)[0].config
+
+
+def load_config(path: Optional[Path] = None) -> Dict[str, Any]:
+    """Read and validate the config file; return {} when the default file does not exist.
+
+    An explicitly given path must exist (you asked for it); the default location is optional.
+    """
+    explicit = path is not None
+    path = path or default_config_path()
+    if not path.is_file():
+        if explicit:
+            raise ConfigError(f"config file not found: {path}")
+        return {}
+    if tomllib is None:
+        raise ConfigError("reading a config file needs Python 3.11 or newer")
+    try:
+        with open(path, "rb") as f:  # tomllib wants a binary file
+            data = tomllib.load(f)
+    except (OSError, tomllib.TOMLDecodeError) as e:
+        raise ConfigError(f"cannot read {path}: {e}") from e
+    for key, value in data.items():
+        if key not in CONFIG_KEYS:
+            raise ConfigError(f"{path}: unknown setting '{key}' (allowed: {', '.join(CONFIG_KEYS)})")
+        # bool is a subclass of int in Python, so `retries = true` would pass an int check.
+        if isinstance(value, bool) or not isinstance(value, CONFIG_KEYS[key]):
+            raise ConfigError(f"{path}: '{key}' has the wrong type ({type(value).__name__})")
+    return data
+
+
+def connection_defaults(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Defaults for --host, --model, --timeout and --retries (environment beats config file)."""
+    return {
+        "host": os.environ.get("OLLAMA_HOST") or config.get("host") or DEFAULT_HOST,
+        "model": os.environ.get("OLLAMA_MODEL") or config.get("model"),
+        "timeout": float(config.get("timeout", DEFAULT_TIMEOUT)),
+        "retries": config.get("retries", DEFAULT_RETRIES),
+    }
+
+
 # ---- command line interface ---------------------------------------------------------------------
 #
 # Each sub-command (`list`, `ask`, ...) is a function taking the client and the parsed arguments
@@ -543,28 +628,34 @@ def _cmd_delete(client: OllamaClient, args: argparse.Namespace) -> int:
     return 0
 
 
-def build_parser() -> argparse.ArgumentParser:
-    """Define the command line: global options first, then one sub-parser per command."""
+def build_parser(config: Optional[Dict[str, Any]] = None) -> argparse.ArgumentParser:
+    """Define the command line: global options first, then one sub-parser per command.
+
+    `config` is the validated config file (see load_config); its values become the defaults.
+    """
+    config = config or {}
+    d = connection_defaults(config)
     parser = argparse.ArgumentParser(description="Talk to a local Ollama server.")
     # Global options come BEFORE the command: `script --host X list`, not `script list --host X`.
-    # Their defaults read environment variables, so OLLAMA_HOST / OLLAMA_MODEL work too.
     parser.add_argument(
-        "--host",
-        default=os.environ.get("OLLAMA_HOST", DEFAULT_HOST),
-        help=f"Ollama server URL (env OLLAMA_HOST, default {DEFAULT_HOST})",
+        "--host", default=d["host"],
+        help=f"Ollama server URL (env OLLAMA_HOST, config 'host'; default {d['host']})",
     )
     parser.add_argument(
-        "-m", "--model",
-        default=os.environ.get("OLLAMA_MODEL"),
-        help="model name (env OLLAMA_MODEL, default: first installed model)",
+        "-m", "--model", default=d["model"],
+        help="model name (env OLLAMA_MODEL, config 'model'; default: first installed model)",
     )
     parser.add_argument(
-        "--timeout", type=float, default=DEFAULT_TIMEOUT,
-        help=f"seconds to wait for data from the server (default {DEFAULT_TIMEOUT:g})",
+        "--timeout", type=float, default=d["timeout"],
+        help=f"seconds to wait for data from the server (default {d['timeout']:g})",
     )
     parser.add_argument(
-        "--retries", type=int, default=DEFAULT_RETRIES,
-        help=f"extra attempts after a transient error (default {DEFAULT_RETRIES})",
+        "--retries", type=int, default=d["retries"],
+        help=f"extra attempts after a transient error (default {d['retries']})",
+    )
+    parser.add_argument(
+        "--config", type=Path,
+        help=f"config file (default {default_config_path()})",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -574,8 +665,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     def add_chat_options(p: argparse.ArgumentParser) -> None:
         """Options shared by `ask` and `chat`."""
-        p.add_argument("-s", "--system", help="system prompt")
-        p.add_argument("-t", "--temperature", type=float, default=0.7)
+        p.add_argument("-s", "--system", default=config.get("system"), help="system prompt")
+        p.add_argument("-t", "--temperature", type=float,
+                       default=float(config.get("temperature", 0.7)))
 
     p_ask = sub.add_parser("ask", help="ask a single question (stdin is appended to the prompt)")
     p_ask.add_argument("prompt", nargs="?", help="the question; may be omitted if text is piped in")
@@ -608,7 +700,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Optional[List[str]] = None) -> int:
     """Entry point. Takes argv as a parameter (None means sys.argv) so tests can call it directly."""
-    args = build_parser().parse_args(argv)
+    try:
+        config = load_config(config_path_from_argv(argv))
+    except ConfigError as e:
+        print(f"Config error: {e}", file=sys.stderr)
+        return 2
+    args = build_parser(config).parse_args(argv)
     client = OllamaClient(args.host, timeout=args.timeout, retries=args.retries)
     # Translate expected failures into a short message and an exit code instead of a traceback.
     try:

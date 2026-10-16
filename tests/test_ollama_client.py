@@ -8,8 +8,10 @@ import io
 import json
 import os
 import socket
+import tempfile
 import time
 import unittest
+from pathlib import Path
 from unittest import mock
 
 import httpx
@@ -452,6 +454,112 @@ class TestCli(FakeServerTestCase):
     def test_command_is_required(self):
         rc, _, err = self.run_cli()
         self.assertEqual(rc, 2)
+
+
+class TestConfigFile(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        # Remove OLLAMA_* so the user's own environment cannot change the outcome.
+        env = {k: v for k, v in os.environ.items() if k not in ("OLLAMA_HOST", "OLLAMA_MODEL")}
+        patcher = mock.patch.dict(os.environ, env, clear=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def write(self, text: str) -> Path:
+        path = Path(self.tmp.name) / "config.toml"
+        path.write_text(text)
+        return path
+
+    def test_missing_default_file_gives_empty_config(self):
+        with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": self.tmp.name}):
+            self.assertEqual(ollama_client.load_config(), {})
+
+    def test_default_path_follows_xdg(self):
+        with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": "/x"}):
+            self.assertEqual(ollama_client.default_config_path(),
+                             Path("/x/python_ollama/config.toml"))
+
+    def test_loads_valid_file(self):
+        path = self.write('host = "http://srv:11434"\nretries = 4\ntemperature = 1\n')
+        config = ollama_client.load_config(path)
+        self.assertEqual(config, {"host": "http://srv:11434", "retries": 4, "temperature": 1})
+
+    def test_explicit_missing_file_is_an_error(self):
+        with self.assertRaisesRegex(ollama_client.ConfigError, "not found"):
+            ollama_client.load_config(Path(self.tmp.name) / "nope.toml")
+
+    def test_unknown_key_is_rejected(self):
+        path = self.write("timout = 30\n")
+        with self.assertRaisesRegex(ollama_client.ConfigError, "unknown setting 'timout'"):
+            ollama_client.load_config(path)
+
+    def test_wrong_type_is_rejected(self):
+        path = self.write('retries = "two"\n')
+        with self.assertRaisesRegex(ollama_client.ConfigError, "'retries' has the wrong type"):
+            ollama_client.load_config(path)
+
+    def test_boolean_is_not_a_number(self):
+        path = self.write("retries = true\n")
+        with self.assertRaises(ollama_client.ConfigError):
+            ollama_client.load_config(path)
+
+    def test_invalid_toml_is_an_error(self):
+        path = self.write("host = \n")
+        with self.assertRaisesRegex(ollama_client.ConfigError, "cannot read"):
+            ollama_client.load_config(path)
+
+    def test_config_path_from_argv(self):
+        self.assertEqual(ollama_client.config_path_from_argv(["--config", "a.toml", "list"]),
+                         Path("a.toml"))
+        self.assertIsNone(ollama_client.config_path_from_argv(["list"]))
+
+    def parse(self, config, *argv, **env):
+        with mock.patch.dict(os.environ, env):
+            return ollama_client.build_parser(config).parse_args(list(argv))
+
+    def test_built_in_defaults_without_config(self):
+        args = self.parse({}, "ask", "hi")
+        self.assertEqual((args.host, args.model, args.timeout, args.retries, args.temperature),
+                         (ollama_client.DEFAULT_HOST, None, ollama_client.DEFAULT_TIMEOUT,
+                          ollama_client.DEFAULT_RETRIES, 0.7))
+
+    def test_config_replaces_defaults(self):
+        config = {"host": "http://srv:1", "model": "m:1", "timeout": 30, "retries": 5,
+                  "temperature": 0.2, "system": "be brief"}
+        args = self.parse(config, "ask", "hi")
+        self.assertEqual((args.host, args.model, args.timeout, args.retries),
+                         ("http://srv:1", "m:1", 30.0, 5))
+        self.assertEqual((args.temperature, args.system), (0.2, "be brief"))
+
+    def test_environment_beats_config(self):
+        args = self.parse({"host": "http://cfg:1", "model": "cfg"}, "list",
+                          OLLAMA_HOST="http://env:1", OLLAMA_MODEL="env")
+        self.assertEqual((args.host, args.model), ("http://env:1", "env"))
+
+    def test_command_line_beats_everything(self):
+        args = self.parse({"host": "http://cfg:1", "temperature": 0.2}, "--host", "http://cli:1",
+                          "ask", "hi", "-t", "1.5", OLLAMA_HOST="http://env:1")
+        self.assertEqual((args.host, args.temperature), ("http://cli:1", 1.5))
+
+    def test_main_reports_bad_config(self):
+        path = self.write("bogus = 1\n")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rc = ollama_client.main(["--config", str(path), "list"])
+        self.assertEqual(rc, 2)
+        self.assertIn("Config error", err.getvalue())
+
+    def test_main_uses_config_file(self):
+        server = FakeOllama()
+        server.start()
+        self.addCleanup(server.stop)
+        path = self.write(f'host = "{server.url}"\n')
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = ollama_client.main(["--config", str(path), "list"])
+        self.assertEqual(rc, 0)
+        self.assertIn("fake:1", out.getvalue())
 
 
 if __name__ == "__main__":

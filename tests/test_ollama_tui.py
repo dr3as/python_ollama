@@ -1110,6 +1110,42 @@ class TestCompareView(TuiTestCase):
             self.assertEqual(self.log_texts()[-1], "msgs=1 last=still there?")
 
 
+class TestConfigDefaults(unittest.TestCase):
+    """The config file supplies defaults for the TUI's command line and first chat."""
+
+    def parse(self, config, *argv):
+        with mock.patch.dict("os.environ", {"OLLAMA_HOST": "", "OLLAMA_MODEL": ""}):
+            return ollama_tui.build_parser(config).parse_args(list(argv))
+
+    def test_config_sets_defaults(self):
+        args = self.parse({"host": "http://srv:1", "retries": 4, "db": "~/x.db"})
+        self.assertEqual((args.host, args.retries), ("http://srv:1", 4))
+        self.assertEqual(args.db, Path("~/x.db").expanduser())
+
+    def test_command_line_beats_config(self):
+        args = self.parse({"host": "http://srv:1"}, "--host", "http://cli:1")
+        self.assertEqual(args.host, "http://cli:1")
+
+    def test_default_db_without_config(self):
+        self.assertEqual(self.parse({}).db, ollama_tui.default_db_path())
+
+    def test_app_starts_with_configured_system_and_temperature(self):
+        store = ChatStore(":memory:")
+        self.addCleanup(store.close)
+        app = OllamaTui(OllamaClient("http://127.0.0.1:1"), store, system="be brief",
+                        temperature=0.2)
+        self.assertEqual((app.session.system, app.session.temperature), ("be brief", 0.2))
+
+    def test_main_reports_bad_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "c.toml"
+            path.write_text("bogus = 1\n")
+            with mock.patch("sys.stderr") as err:
+                rc = ollama_tui.main(["--config", str(path)])
+        self.assertEqual(rc, 2)
+        self.assertIn("Config error", "".join(c.args[0] for c in err.write.call_args_list))
+
+
 class TestTuiOffline(AsyncTestCase):
     async def test_unreachable_server_does_not_crash(self):
         from tests.test_ollama_client import unused_url

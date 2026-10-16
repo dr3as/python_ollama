@@ -33,6 +33,7 @@ import shutil
 import socket
 import sqlite3
 import subprocess
+import sys
 import threading
 import time
 from datetime import datetime, timezone
@@ -65,7 +66,8 @@ except ImportError:
     psutil = None
 
 from ollama_client import (
-    DEFAULT_HOST, DEFAULT_RETRIES, DEFAULT_TIMEOUT, ChatSession, OllamaClient,
+    ChatSession, ConfigError, OllamaClient, config_path_from_argv, connection_defaults,
+    default_config_path, load_config,
 )
 # format_bytes lives in ollama_compare (which this module already depends on) so there is one copy.
 from ollama_compare import ModelRun, compare_models, comparison_markdown, format_bytes, metric_rows
@@ -1101,13 +1103,14 @@ class OllamaTui(App):
     ]
 
     def __init__(self, client: OllamaClient, store: ChatStore, model: Optional[str] = None,
-                 host_label: Optional[str] = None):
+                 host_label: Optional[str] = None, system: Optional[str] = None,
+                 temperature: float = 0.7):
         super().__init__()
         self.client = client
         self.store = store
         self.model = model
         self.model_names: List[str] = []
-        self.session = ChatSession(client)
+        self.session = ChatSession(client, system=system, temperature=temperature)
         self.chat_id: Optional[int] = None  # None until the first reply is saved
         self.busy = False  # True while a reply is streaming in
         # A threading.Event is a flag that is safe to share between threads. The UI thread sets it
@@ -1773,28 +1776,43 @@ class OllamaTui(App):
         self.push_screen(ConfirmScreen("Delete this chat?"), answered)
 
 
-def build_parser() -> argparse.ArgumentParser:
-    """Command line options. They mirror ollama_client.py, plus --db for the chat database."""
+def build_parser(config: Optional[dict] = None) -> argparse.ArgumentParser:
+    """Command line options. They mirror ollama_client.py, plus --db for the chat database.
+
+    `config` is the validated config file (see ollama_client.load_config); it sets the defaults.
+    """
+    config = config or {}
+    d = connection_defaults(config)
+    db_default = Path(config["db"]).expanduser() if "db" in config else default_db_path()
     parser = argparse.ArgumentParser(description="Full-screen terminal chat for Ollama.")
-    parser.add_argument("--host", default=os.environ.get("OLLAMA_HOST", DEFAULT_HOST),
-                        help=f"Ollama server URL (env OLLAMA_HOST, default {DEFAULT_HOST})")
-    parser.add_argument("-m", "--model", default=os.environ.get("OLLAMA_MODEL"),
-                        help="model name (env OLLAMA_MODEL, default: first installed model)")
-    parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT,
-                        help=f"seconds to wait for data from the server (default {DEFAULT_TIMEOUT:g})")
-    parser.add_argument("--retries", type=int, default=DEFAULT_RETRIES,
-                        help=f"extra attempts after a transient error (default {DEFAULT_RETRIES})")
-    parser.add_argument("--db", type=Path, default=default_db_path(),
+    parser.add_argument("--host", default=d["host"],
+                        help=f"Ollama server URL (env OLLAMA_HOST, config 'host'; default {d['host']})")
+    parser.add_argument("-m", "--model", default=d["model"],
+                        help="model name (env OLLAMA_MODEL, config 'model'; default: first installed model)")
+    parser.add_argument("--timeout", type=float, default=d["timeout"],
+                        help=f"seconds to wait for data from the server (default {d['timeout']:g})")
+    parser.add_argument("--retries", type=int, default=d["retries"],
+                        help=f"extra attempts after a transient error (default {d['retries']})")
+    parser.add_argument("--db", type=Path, default=db_default,
                         help="chat database file (default: %(default)s)")
+    parser.add_argument("--config", type=Path,
+                        help=f"config file (default {default_config_path()})")
     return parser
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    args = build_parser().parse_args(argv)
+    try:
+        config = load_config(config_path_from_argv(argv))
+    except ConfigError as e:
+        print(f"Config error: {e}", file=sys.stderr)
+        return 2
+    args = build_parser(config).parse_args(argv)
     client = OllamaClient(args.host, timeout=args.timeout, retries=args.retries)
     store = ChatStore(args.db)
+    app = OllamaTui(client, store, model=args.model, system=config.get("system"),
+                    temperature=float(config.get("temperature", 0.7)))
     try:
-        OllamaTui(client, store, model=args.model).run()  # blocks until the user quits
+        app.run()  # blocks until the user quits
     finally:
         store.close()  # close the database even if the app crashed
     return 0

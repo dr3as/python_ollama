@@ -129,6 +129,28 @@ Global options (before the command): `--host URL` (env `OLLAMA_HOST`), `-m/--mod
 (env `OLLAMA_MODEL`; default is the first installed model), `--timeout SECONDS` (default 120)
 and `--retries N` (default 2).
 
+## Config file
+
+Defaults live in an optional TOML file, `~/.config/python_ollama/config.toml`
+(`$XDG_CONFIG_HOME` is respected; use `--config PATH` for another file). The CLI and the TUI read
+the same file. Every key is optional:
+
+```toml
+host = "http://server:11434"   # --host
+model = "llama3"               # --model
+timeout = 120                  # --timeout, seconds
+retries = 2                    # --retries
+temperature = 0.7              # default for ask/chat and the TUI's first chat
+system = "You are a security analyst."   # default system prompt
+db = "~/chats.db"              # TUI chat database (--db)
+```
+
+Order of precedence, highest first: command-line option, environment variable (`OLLAMA_HOST`,
+`OLLAMA_MODEL`), config file, built-in default. An unknown key or a value of the wrong type stops
+the program with a `Config error` message (exit code 2) rather than being ignored. Reading the
+file needs Python 3.11+ (`tomllib`); a missing default file is fine. The TUI's Settings tab and
+`/system`, `/temp` still change values for the current chat only; they do not write the file.
+
 ## Timeouts and retries
 
 The timeout applies to each wait for data from the server, not to the whole request, so a long
