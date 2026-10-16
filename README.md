@@ -46,6 +46,14 @@ accept): `/help`, `/new`, `/model [name]`, `/pull name`, `/show [name]`, `/delet
 Esc stops a running reply, Ctrl+N starts a new chat, Ctrl+Q quits. Replies are rendered as
 Markdown with highlighted code blocks.
 
+The two-line status bar under the chat shows the model, temperature and system prompt, and
+below that the numbers: context used/total (`ctx ~1,500/4,096 (36%)`), tokens per second, tokens
+in/out for the last reply, model load time (only if noticeable) and total reply tokens this
+session. While a reply streams it shows a live token count and speed. The context figure is
+approximate: Ollama reports only the tokens it evaluated for the request, which can be fewer
+than the whole conversation when part of it was cached. The context total is the window the
+model is actually running with, read from Ollama's `/api/ps`.
+
 Chats are saved automatically (after each completed reply) in a SQLite database at
 `~/.local/share/ollama_tui/chats.db` (`$XDG_DATA_HOME` is respected; override with `--db`).
 A reply you stop or that fails is shown but not saved. Esc takes effect when the next piece

@@ -5,6 +5,17 @@ import threading
 import time
 
 
+def stats(body, text):
+    """Fixed timing fields: 10 prompt tokens per message, one reply token per word, 0.5 s of eval."""
+    return {
+        "prompt_eval_count": 10 * len(body["messages"]),
+        "eval_count": len(text.split(" ")),
+        "eval_duration": 500_000_000,
+        "load_duration": 100_000_000,
+        "total_duration": 700_000_000,
+    }
+
+
 class FakeOllama:
     """Serves /api/tags, /api/chat and /api/embed and records the chat/embed request bodies.
 
@@ -17,6 +28,7 @@ class FakeOllama:
         self.models = list(models)
         self.requests = []
         self.fail_next = 0
+        self.running = [self.models[0]] if self.models else []
         self.slow_seconds = 1.0
         outer = self
 
@@ -39,6 +51,12 @@ class FakeOllama:
                 self.wfile.write(body)
 
             def do_GET(self):
+                if self.path == "/api/ps":
+                    return self._json({"models": [
+                        {"model": m, "name": m, "size": 4_000_000_000, "size_vram": 3_000_000_000,
+                         "context_length": 4096, "expires_at": "2026-01-01T00:05:00Z"}
+                        for m in outer.running
+                    ]})
                 self._json({"models": [
                     {"model": m, "modified_at": "2026-01-01T00:00:00Z"} for m in outer.models
                 ]})
@@ -98,7 +116,7 @@ class FakeOllama:
                     return self._json({
                         "model": body["model"],
                         "message": {"role": "assistant", "content": text},
-                        "done": True,
+                        "done": True, **stats(body, text),
                     })
                 self.send_response(200)
                 self.send_header("Content-Type", "application/x-ndjson")
@@ -110,7 +128,7 @@ class FakeOllama:
                              "message": {"role": "assistant", "content": piece}}
                     self.wfile.write((json.dumps(chunk) + "\n").encode())
                 done = {"model": body["model"], "done": True,
-                        "message": {"role": "assistant", "content": ""}}
+                        "message": {"role": "assistant", "content": ""}, **stats(body, text)}
                 self.wfile.write((json.dumps(done) + "\n").encode())
 
         self._server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)

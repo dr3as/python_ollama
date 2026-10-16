@@ -19,6 +19,23 @@ DEFAULT_RETRY_DELAY = 1.0  # first backoff in seconds; doubles on every further 
 T = TypeVar("T")
 
 
+def chat_stats(response) -> Dict[str, Any]:
+    """Token counts and speed from a finished chat response (or the final streamed chunk).
+
+    Ollama reports durations in nanoseconds. Missing values count as 0.
+    """
+    prompt_tokens = response.prompt_eval_count or 0
+    reply_tokens = response.eval_count or 0
+    eval_seconds = (response.eval_duration or 0) / 1e9
+    return {
+        "prompt_tokens": prompt_tokens,
+        "reply_tokens": reply_tokens,
+        "tokens_per_second": reply_tokens / eval_seconds if eval_seconds > 0 else 0.0,
+        "load_seconds": (response.load_duration or 0) / 1e9,
+        "total_seconds": (response.total_duration or 0) / 1e9,
+    }
+
+
 def _is_transient(error: Exception) -> bool:
     """True for errors that may go away on a retry: network trouble, timeouts, overloaded server."""
     if isinstance(error, ollama.ResponseError):
@@ -177,6 +194,19 @@ class OllamaClient:
             "modified_at": info.modified_at,
         }
 
+    def running_models(self) -> List[Dict[str, Any]]:
+        """Models currently loaded in memory, with how much of each sits in VRAM."""
+        return [
+            {
+                "name": m.model or m.name,
+                "size": m.size or 0,
+                "size_vram": m.size_vram or 0,
+                "context_length": m.context_length,
+                "expires_at": m.expires_at,
+            }
+            for m in self._with_retries(self._client.ps).models
+        ]
+
     def delete_model(self, model: str) -> None:
         """Delete an installed model. Raises ollama.ResponseError if it does not exist."""
         self._client.delete(model)
@@ -236,6 +266,7 @@ class ChatSession:
         self.system = system
         self.temperature = temperature
         self.messages: List[Dict[str, str]] = []
+        self.last_stats: Optional[Dict[str, Any]] = None  # chat_stats() of the latest finished reply
         self.reset()
 
     def reset(self) -> None:
@@ -266,15 +297,21 @@ class ChatSession:
         if not stream:
             reply = response.message.content or ""
             self.messages.append({"role": "assistant", "content": reply})
+            self.last_stats = chat_stats(response)
             return reply
         return self._stream_reply(response)
 
     def _stream_reply(self, response) -> Iterator[str]:
         parts: List[str] = []
+        final_chunk = None
         try:
-            for content in OllamaClient._iter_content(response):
-                parts.append(content)
-                yield content
+            for chunk in response:
+                if chunk.done:
+                    final_chunk = chunk
+                content = chunk.message.content
+                if content:
+                    parts.append(content)
+                    yield content
         except GeneratorExit:
             self.messages.pop()  # abandoned stream: drop the unanswered user message
             raise
@@ -282,6 +319,8 @@ class ChatSession:
             self.messages.pop()
             raise
         self.messages.append({"role": "assistant", "content": "".join(parts)})
+        if final_chunk is not None:
+            self.last_stats = chat_stats(final_chunk)
 
 
 def _resolve_model(client: OllamaClient, requested: Optional[str]) -> str:

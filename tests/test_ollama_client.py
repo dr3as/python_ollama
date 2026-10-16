@@ -192,6 +192,49 @@ class TestModelManagement(FakeServerTestCase):
             self.client.delete_model("missing")
 
 
+class TestStats(FakeServerTestCase):
+    EXPECTED = {"prompt_tokens": 10, "reply_tokens": 2, "tokens_per_second": 4.0,
+                "load_seconds": 0.1, "total_seconds": 0.7}
+
+    def test_no_stats_before_first_reply(self):
+        self.assertIsNone(ChatSession(self.client).last_stats)
+
+    def test_stats_after_plain_reply(self):
+        session = ChatSession(self.client)
+        session.send("one")  # "msgs=1 last=one" is 2 words
+        self.assertEqual(session.last_stats, self.EXPECTED)
+
+    def test_stats_after_streamed_reply(self):
+        session = ChatSession(self.client)
+        "".join(session.send("one", stream=True))
+        self.assertEqual(session.last_stats, self.EXPECTED)
+
+    def test_stats_grow_with_history(self):
+        session = ChatSession(self.client)
+        session.send("one")
+        session.send("two")
+        self.assertEqual(session.last_stats["prompt_tokens"], 30)  # 3 messages
+
+    def test_abandoned_stream_keeps_previous_stats(self):
+        session = ChatSession(self.client)
+        session.send("one")
+        stream = session.send("two", stream=True)
+        next(stream)
+        stream.close()
+        self.assertEqual(session.last_stats, self.EXPECTED)
+
+    def test_chat_stats_treats_missing_values_as_zero(self):
+        empty = ollama_client.ollama.ChatResponse(message=ollama_client.ollama.Message(role="assistant"))
+        stats = ollama_client.chat_stats(empty)
+        self.assertEqual((stats["reply_tokens"], stats["tokens_per_second"]), (0, 0.0))
+
+    def test_running_models(self):
+        loaded = self.client.running_models()
+        self.assertEqual([m["name"] for m in loaded], ["fake:1"])
+        self.assertEqual(loaded[0]["context_length"], 4096)
+        self.assertEqual((loaded[0]["size"], loaded[0]["size_vram"]), (4_000_000_000, 3_000_000_000))
+
+
 class TestChatSession(FakeServerTestCase):
     def test_history_grows_between_turns(self):
         session = ChatSession(self.client)

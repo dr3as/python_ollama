@@ -4,7 +4,7 @@ import unittest
 from textual.widgets import Input, ListView
 
 from ollama_client import OllamaClient
-from ollama_tui import ChatStore, ConfirmScreen, InfoScreen, OllamaTui
+from ollama_tui import ChatStore, ConfirmScreen, InfoScreen, OllamaTui, format_stats
 from tests.fake_ollama import FakeOllama
 
 
@@ -59,6 +59,35 @@ class AsyncTestCase(unittest.IsolatedAsyncioTestCase):
         self._asyncioRunner = asyncio.Runner(debug=False)
 
 
+LAST = {"prompt_tokens": 1200, "reply_tokens": 300, "tokens_per_second": 42.5,
+        "load_seconds": 0.1, "total_seconds": 8.0}
+
+
+class TestFormatStats(unittest.TestCase):
+    def test_no_replies_yet(self):
+        self.assertEqual(format_stats(None, None, 0), "no replies yet")
+
+    def test_full_line(self):
+        self.assertEqual(
+            format_stats(LAST, 4096, 1500),
+            "ctx ~1,500/4,096 (36%) · 42.5 tok/s · last 1,200 in / 300 out · session 1,500 out",
+        )
+
+    def test_without_context_total(self):
+        self.assertTrue(format_stats(LAST, None, 300).startswith("ctx ~1,500 · "))
+
+    def test_load_time_shown_only_when_noticeable(self):
+        self.assertNotIn("load", format_stats(LAST, 4096, 0))
+        self.assertIn("load 3.2s", format_stats({**LAST, "load_seconds": 3.2}, 4096, 0))
+
+    def test_live_numbers_while_streaming(self):
+        self.assertEqual(format_stats(LAST, 4096, 0, live=(50, 2.0)),
+                         "receiving: ~50 tokens · ~25.0 tok/s")
+
+    def test_live_with_no_elapsed_time(self):
+        self.assertEqual(format_stats(None, None, 0, live=(1, 0.0)), "receiving: ~1 tokens")
+
+
 class TuiTestCase(AsyncTestCase):
     async def asyncSetUp(self):
         self.server = FakeOllama().start()
@@ -97,6 +126,30 @@ class TestTui(TuiTestCase):
             self.assertEqual(chat["title"], "hello")
             self.assertEqual([m["role"] for m in chat["messages"]], ["user", "assistant"])
             self.assertEqual(len(self.app.query_one("#chats", ListView).children), 1)
+
+    async def test_status_bar_shows_stats_after_reply(self):
+        async with self.app.run_test(size=(120, 40)) as pilot:
+            await self.settle(pilot)
+            self.assertIn("no replies yet", self.app.status_text)
+            await self.say(pilot, "hello")  # reply "msgs=1 last=hello": 2 tokens in 0.5 s
+            await self.settle(pilot)
+            self.assertIn("ctx ~12/4,096 (0%)", self.app.status_text)
+            self.assertIn("4.0 tok/s", self.app.status_text)
+            self.assertIn("session 2 out", self.app.status_text)
+            await self.say(pilot, "again")
+            self.assertIn("session 4 out", self.app.status_text)
+
+    async def test_stats_reset_for_new_chat_and_model_switch(self):
+        async with self.app.run_test(size=(120, 40)) as pilot:
+            await self.settle(pilot)
+            await self.say(pilot, "hello")
+            await self.settle(pilot)
+            await self.say(pilot, "/new")
+            self.assertIn("no replies yet", self.app.status_text)
+            await self.say(pilot, "hello")
+            await self.settle(pilot)
+            await self.say(pilot, "/model nomic-embed-text:latest")
+            self.assertIn("no replies yet", self.app.status_text)
 
     async def test_history_is_sent_with_follow_up(self):
         async with self.app.run_test(size=(120, 40)) as pilot:

@@ -135,6 +135,33 @@ class ChatStore:
             self._db.execute("DELETE FROM chats WHERE id = ?", (chat_id,))
 
 
+def format_stats(last: Optional[Dict[str, Any]], context_total: Optional[int],
+                 session_tokens: int, live: Optional[tuple] = None) -> str:
+    """One line of numbers for the status bar. live is (chunks so far, seconds) while streaming."""
+    if live is not None:
+        chunks, seconds = live
+        speed = f" · ~{chunks / seconds:.1f} tok/s" if seconds > 0 else ""
+        return f"receiving: ~{chunks:,} tokens{speed}"
+    if last is None:
+        return "no replies yet"
+    # prompt_tokens is what Ollama evaluated for this request (it can be lower than the whole
+    # conversation when part of it was cached), so the context figure is approximate.
+    used = last["prompt_tokens"] + last["reply_tokens"]
+    if context_total:
+        context = f"ctx ~{used:,}/{context_total:,} ({used * 100 // context_total}%)"
+    else:
+        context = f"ctx ~{used:,}"
+    parts = [
+        context,
+        f"{last['tokens_per_second']:.1f} tok/s",
+        f"last {last['prompt_tokens']:,} in / {last['reply_tokens']:,} out",
+    ]
+    if last["load_seconds"] >= 0.5:
+        parts.append(f"load {last['load_seconds']:.1f}s")
+    parts.append(f"session {session_tokens:,} out")
+    return " · ".join(parts)
+
+
 class CommandSuggester(Suggester):
     """Completes slash commands, and model names after /model, /show, /delete and /pull."""
 
@@ -259,7 +286,7 @@ class OllamaTui(App):
     .msg.assistant { border-left: thick $success; }
     .msg.error { border-left: thick $error; }
     #welcome { color: $text-muted; margin: 1 2; }
-    #status { height: 1; padding: 0 1; background: $boost; color: $text-muted; }
+    #status { height: 2; padding: 0 1; background: $boost; color: $text-muted; }
     #prompt { margin: 0 1; }
     #progress { display: none; margin: 1 0 0 0; }
     #progress.visible { display: block; }
@@ -290,6 +317,10 @@ class OllamaTui(App):
         self.chat_id: Optional[int] = None
         self.busy = False
         self._cancel = threading.Event()
+        self.context_total: Optional[int] = None  # context window of the loaded model, from /api/ps
+        self.session_tokens = 0  # reply tokens received since the app started
+        self._live: Optional[tuple] = None  # (chunks, seconds) while a reply streams in
+        self.status_text = ""  # what the status bar shows (also read by the tests)
         self.sub_title = host_label or client.base_url
 
     # ---- layout -------------------------------------------------------------------------
@@ -348,10 +379,17 @@ class OllamaTui(App):
     def _update_status(self) -> None:
         state = "generating... (Esc to stop)" if self.busy else "ready"
         system = "set" if self.session.system else "none"
-        self.query_one("#status", Static).update(
-            f"model: {self.model or '(none)'} · temp {self.session.temperature:g}"
-            f" · system: {system} · {state}"
-        )
+        stats = format_stats(self.session.last_stats, self.context_total,
+                             self.session_tokens, self._live if self.busy else None)
+        self.status_text = (f"model: {self.model or '(none)'} · temp {self.session.temperature:g}"
+                            f" · system: {system} · {state}\n{stats}")
+        self.query_one("#status", Static).update(self.status_text)
+
+    def _clear_stats(self) -> None:
+        """Forget per-conversation numbers (new chat, loaded chat or another model)."""
+        self.session.last_stats = None
+        self.context_total = None
+        self._live = None
 
     def _set_busy(self, busy: bool) -> None:
         self.busy = busy
@@ -368,6 +406,8 @@ class OllamaTui(App):
         self.notify(_describe(error), severity="error", timeout=8)
 
     def _set_model(self, name: str) -> None:
+        if name != self.model:
+            self._clear_stats()
         self.model = name
         self.session.model = name
         if self.chat_id is not None:
@@ -385,6 +425,8 @@ class OllamaTui(App):
         self.chat_id = None
         self.session = ChatSession(self.client, model=self.model, system=self.session.system,
                                    temperature=self.session.temperature)
+        self._clear_stats()
+        self._update_status()
         await self._render_messages([])
         self.query_one("#prompt").focus()
 
@@ -440,6 +482,7 @@ class OllamaTui(App):
         stopped = False
         try:
             stream = self.session.send(text, stream=True)
+            started = time.monotonic()
             last_paint = 0.0
             for chunk in stream:
                 if self._cancel.is_set():
@@ -450,12 +493,16 @@ class OllamaTui(App):
                 now = time.monotonic()
                 if now - last_paint >= 0.05:
                     last_paint = now
-                    self.call_from_thread(self._show_partial, widget, "".join(parts))
+                    # each streamed chunk is about one token
+                    self.call_from_thread(self._show_partial, widget, "".join(parts),
+                                          (len(parts), now - started))
         except Exception as e:
             error = _describe(e)
         self.call_from_thread(self._reply_finished, widget, text, "".join(parts), error, stopped)
 
-    async def _show_partial(self, widget: AssistantMessage, text: str) -> None:
+    async def _show_partial(self, widget: AssistantMessage, text: str, live: tuple) -> None:
+        self._live = live
+        self._update_status()
         await widget.update(text)
         self.query_one("#log", VerticalScroll).scroll_end(animate=False)
 
@@ -469,9 +516,27 @@ class OllamaTui(App):
         else:
             await widget.update(reply)
             self._save_exchange(text, reply)
+            if self.session.last_stats:
+                self.session_tokens += self.session.last_stats["reply_tokens"]
+            self._fetch_context_total(self.model)
         self.query_one("#log", VerticalScroll).scroll_end(animate=False)
+        self._live = None
         self._set_busy(False)
         self.query_one("#prompt").focus()
+
+    @work(thread=True, exit_on_error=False, group="stats")
+    def _fetch_context_total(self, model: Optional[str]) -> None:
+        """Ask Ollama which context window the loaded model really runs with."""
+        try:
+            loaded = {m["name"]: m["context_length"] for m in self.client.running_models()}
+        except Exception:
+            return  # the number is a nicety; the bar just shows ctx without a total
+        self.call_from_thread(self._set_context_total, model, loaded.get(model))
+
+    def _set_context_total(self, model: Optional[str], total: Optional[int]) -> None:
+        if model == self.model and total:
+            self.context_total = total
+            self._update_status()
 
     def _save_exchange(self, user_text: str, reply: str) -> None:
         if self.chat_id is None:
@@ -736,6 +801,7 @@ class OllamaTui(App):
         self.session = ChatSession(self.client, model=self.model, system=chat["system"],
                                    temperature=chat["temperature"])
         self.session.messages.extend(chat["messages"])
+        self._clear_stats()
         self.query_one("#setting-system", Input).value = chat["system"] or ""
         self.query_one("#setting-temp", Input).value = f"{chat['temperature']:g}"
         await self._render_messages(chat["messages"])
