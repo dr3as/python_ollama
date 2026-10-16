@@ -474,6 +474,12 @@ class OllamaTui(App):
 
     # ---- layout -------------------------------------------------------------------------
 
+    @property
+    def main_screen(self):
+        """The chat screen. App.query_one() only searches the screen on top, which is a dialog
+        while one is open, so timers and background workers must look things up here."""
+        return self.screen_stack[0]
+
     def compose(self) -> ComposeResult:
         yield Header()
         with Horizontal(id="body"):
@@ -520,8 +526,8 @@ class OllamaTui(App):
 
     def on_mount(self) -> None:
         if self.size.width < 100:
-            self.query_one("#sidebar").add_class("hidden")
-        self.query_one("#prompt").focus()
+            self.main_screen.query_one("#sidebar").add_class("hidden")
+        self.main_screen.query_one("#prompt").focus()
         self._refresh_chats()
         self._load_models(select_first=self.model is None)
         self._update_status()
@@ -538,7 +544,7 @@ class OllamaTui(App):
                              self.session_tokens, self._live if self.busy else None)
         self.status_text = (f"model: {self.model or '(none)'} · temp {self.session.temperature:g}"
                             f" · system: {system} · {state}\n{stats}")
-        self.query_one("#status", Static).update(self.status_text)
+        self.main_screen.query_one("#status", Static).update(self.status_text)
 
     def _clear_stats(self) -> None:
         """Forget per-conversation numbers (new chat, loaded chat or another model)."""
@@ -572,7 +578,7 @@ class OllamaTui(App):
     # ---- actions ------------------------------------------------------------------------------
 
     def action_toggle_sidebar(self) -> None:
-        self.query_one("#sidebar").toggle_class("hidden")
+        self.main_screen.query_one("#sidebar").toggle_class("hidden")
 
     async def action_new_chat(self) -> None:
         if not self._guard():
@@ -583,7 +589,7 @@ class OllamaTui(App):
         self._clear_stats()
         self._update_status()
         await self._render_messages([])
-        self.query_one("#prompt").focus()
+        self.main_screen.query_one("#prompt").focus()
 
     def action_cancel(self) -> None:
         if self.busy:
@@ -599,7 +605,7 @@ class OllamaTui(App):
     # ---- chat log -----------------------------------------------------------------------------
 
     async def _render_messages(self, messages: List[Dict[str, str]]) -> None:
-        log = self.query_one("#log", VerticalScroll)
+        log = self.main_screen.query_one("#log", VerticalScroll)
         await log.remove_children()
         if not messages:
             await log.mount(Static(self._welcome_text(), id="welcome"))
@@ -618,8 +624,8 @@ class OllamaTui(App):
             self.notify("No model selected. Pick one in the side panel or use /pull NAME.",
                         severity="warning")
             return
-        log = self.query_one("#log", VerticalScroll)
-        for welcome in self.query("#welcome"):
+        log = self.main_screen.query_one("#log", VerticalScroll)
+        for welcome in self.main_screen.query("#welcome"):
             await welcome.remove()
         await log.mount(UserMessage(text, classes="msg user"))
         reply = AssistantMessage("…", classes="msg assistant")
@@ -659,7 +665,7 @@ class OllamaTui(App):
         self._live = live
         self._update_status()
         await widget.update(text)
-        self.query_one("#log", VerticalScroll).scroll_end(animate=False)
+        self.main_screen.query_one("#log", VerticalScroll).scroll_end(animate=False)
 
     async def _reply_finished(self, widget: AssistantMessage, text: str, reply: str,
                               error: Optional[str], stopped: bool) -> None:
@@ -674,10 +680,10 @@ class OllamaTui(App):
             if self.session.last_stats:
                 self.session_tokens += self.session.last_stats["reply_tokens"]
             self._fetch_context_total(self.model)
-        self.query_one("#log", VerticalScroll).scroll_end(animate=False)
+        self.main_screen.query_one("#log", VerticalScroll).scroll_end(animate=False)
         self._live = None
         self._set_busy(False)
-        self.query_one("#prompt").focus()
+        self.main_screen.query_one("#prompt").focus()
 
     @work(thread=True, exit_on_error=False, group="stats")
     def _fetch_context_total(self, model: Optional[str]) -> None:
@@ -774,7 +780,7 @@ class OllamaTui(App):
         self.session.system = text or None
         if self.chat_id is not None:
             self.store.update_chat(self.chat_id, system=self.session.system)
-        self.query_one("#setting-system", Input).value = text
+        self.main_screen.query_one("#setting-system", Input).value = text
         self._update_status()
         self.notify("System prompt set." if text else "System prompt cleared.")
 
@@ -792,7 +798,7 @@ class OllamaTui(App):
         self.session.temperature = value
         if self.chat_id is not None:
             self.store.update_chat(self.chat_id, temperature=value)
-        self.query_one("#setting-temp", Input).value = f"{value:g}"
+        self.main_screen.query_one("#setting-temp", Input).value = f"{value:g}"
         self._update_status()
 
     def _rename_chat(self, title: str) -> None:
@@ -815,8 +821,8 @@ class OllamaTui(App):
     # ---- resources ----------------------------------------------------------------------------
 
     def _resources_visible(self) -> bool:
-        return (self.query_one(TabbedContent).active == "tab-resources"
-                and not self.query_one("#sidebar").has_class("hidden"))
+        return (self.main_screen.query_one(TabbedContent).active == "tab-resources"
+                and not self.main_screen.query_one("#sidebar").has_class("hidden"))
 
     @on(TabbedContent.TabActivated)
     def _tab_activated(self) -> None:
@@ -843,7 +849,7 @@ class OllamaTui(App):
 
     def _show_resources(self, loaded, error, host, gpus) -> None:
         self.resources_text = format_resources(loaded, error, self.is_local, host, gpus)
-        self.query_one("#resources", Static).update(Text(self.resources_text))
+        self.main_screen.query_one("#resources", Static).update(Text(self.resources_text))
         self._polling = False
 
     # ---- models -------------------------------------------------------------------------------
@@ -863,19 +869,19 @@ class OllamaTui(App):
             self._set_model(names[0])
         elif select_first and not names:
             self.notify("No models installed. Use /pull NAME to download one.", severity="warning")
-        view = self.query_one("#models", ListView)
+        view = self.main_screen.query_one("#models", ListView)
         await view.clear()
         await view.extend(KeyedItem(n, n) for n in names)
 
     def _highlighted_model(self) -> Optional[str]:
-        item = self.query_one("#models", ListView).highlighted_child
+        item = self.main_screen.query_one("#models", ListView).highlighted_child
         return item.key if isinstance(item, KeyedItem) else None
 
     @on(ListView.Selected, "#models")
     async def _model_selected(self, event: ListView.Selected) -> None:
         if self._guard():
             self._set_model(event.item.key)
-            self.query_one("#prompt").focus()
+            self.main_screen.query_one("#prompt").focus()
 
     @on(Button.Pressed, "#refresh-models")
     def _refresh_pressed(self) -> None:
@@ -900,7 +906,7 @@ class OllamaTui(App):
     @on(Button.Pressed, "#pull-model")
     @on(Input.Submitted, "#pull-name")
     def _pull_pressed(self) -> None:
-        field = self.query_one("#pull-name", Input)
+        field = self.main_screen.query_one("#pull-name", Input)
         if field.value.strip():
             self._pull(field.value.strip())
             field.value = ""
@@ -922,8 +928,8 @@ class OllamaTui(App):
         self.call_from_thread(self.push_screen, InfoScreen(name, body))
 
     def _pull(self, name: str) -> None:
-        self._pull_worker(name, self.query_one("#progress", ProgressBar),
-                          self.query_one("#pull-status", Label))
+        self._pull_worker(name, self.main_screen.query_one("#progress", ProgressBar),
+                          self.main_screen.query_one("#pull-status", Label))
 
     @work(thread=True, exit_on_error=False, group="model-ops")
     def _pull_worker(self, name: str, bar: ProgressBar, label: Label) -> None:
@@ -969,7 +975,7 @@ class OllamaTui(App):
     # ---- saved chats --------------------------------------------------------------------------
 
     def _refresh_chats(self) -> None:
-        view = self.query_one("#chats", ListView)
+        view = self.main_screen.query_one("#chats", ListView)
         chats = self.store.list_chats()
         view.clear()
         view.extend(KeyedItem(f"{c['title']}  ({c['updated_at'][:10]})", c["id"]) for c in chats)
@@ -991,11 +997,11 @@ class OllamaTui(App):
                                    temperature=chat["temperature"])
         self.session.messages.extend(chat["messages"])
         self._clear_stats()
-        self.query_one("#setting-system", Input).value = chat["system"] or ""
-        self.query_one("#setting-temp", Input).value = f"{chat['temperature']:g}"
+        self.main_screen.query_one("#setting-system", Input).value = chat["system"] or ""
+        self.main_screen.query_one("#setting-temp", Input).value = f"{chat['temperature']:g}"
         await self._render_messages(chat["messages"])
         self._update_status()
-        self.query_one("#prompt").focus()
+        self.main_screen.query_one("#prompt").focus()
 
     @on(Button.Pressed, "#new-chat")
     async def _new_pressed(self) -> None:
@@ -1003,7 +1009,7 @@ class OllamaTui(App):
 
     @on(Button.Pressed, "#delete-chat")
     def _delete_chat_pressed(self) -> None:
-        item = self.query_one("#chats", ListView).highlighted_child
+        item = self.main_screen.query_one("#chats", ListView).highlighted_child
         if not isinstance(item, KeyedItem):
             self.notify("Select a chat first.", severity="warning")
             return

@@ -277,6 +277,22 @@ class TestTui(TuiTestCase):
             await self.say(pilot, "/model nomic-embed-text:latest")
             self.assertIn("no replies yet", self.app.status_text)
 
+    async def test_reply_finishes_while_a_dialog_is_open(self):
+        self.server.slow_seconds = 1.0
+        async with self.app.run_test(size=(120, 40)) as pilot:
+            await self.settle(pilot)
+            self.app.query_one("#prompt", Input).value = "slow"
+            await pilot.press("enter")
+            await pilot.press("f1")  # open the help dialog while the reply is still coming
+            self.assertIsInstance(self.app.screen, InfoScreen)
+            await pilot.pause(1.5)
+            await self.settle(pilot)
+            await pilot.press("escape")
+            await pilot.pause()
+            self.assertFalse(self.app.busy)
+            self.assertIn("ready", self.app.status_text)
+            self.assertEqual(self.log_texts()[-1], "msgs=1 last=slow")
+
     async def test_history_is_sent_with_follow_up(self):
         async with self.app.run_test(size=(120, 40)) as pilot:
             await self.settle(pilot)
@@ -486,6 +502,19 @@ class TestResourcesTab(TuiTestCase):
             await pilot.pause(2.5)
             await self.settle(pilot)
             self.assertIn("fake:1", self.app.resources_text)  # stale: hidden panel is not refreshed
+
+    async def test_polling_keeps_working_while_a_dialog_is_open(self):
+        # App.query_one searches the screen on top, so a dialog used to hide the whole UI from the timer
+        async with self.app.run_test(size=(120, 40)) as pilot:
+            await self.settle(pilot)
+            await self.show_tab(pilot)
+            await self.say(pilot, "/delete fake:1")
+            self.assertIsInstance(self.app.screen, ConfirmScreen)
+            self.server.running.clear()
+            await pilot.pause(2.5)  # the 2 s poll timer fires while the dialog is open
+            await self.settle(pilot)
+            self.assertIn("none (a model loads", self.app.resources_text)
+            await pilot.press("n")
 
     async def test_server_down_shows_error_in_tab(self):
         from tests.test_ollama_client import unused_url
