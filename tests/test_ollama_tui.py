@@ -5,12 +5,13 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest import mock
 
+from textual import events
 from textual.widgets import Input, ListView, TabbedContent
 
 from ollama_client import OllamaClient
 import ollama_tui
 from ollama_tui import (
-    ChatStore, ChoiceScreen, ConfirmScreen, InfoScreen, OllamaTui, format_bytes, format_resources, format_stats,
+    ChatStore, ChoiceScreen, PromptArea, ConfirmScreen, InfoScreen, OllamaTui, format_bytes, format_resources, format_stats,
     context_percent, is_local_host, parse_nvidia_smi, read_gpus, read_host_stats,
 )
 from tests.fake_ollama import FakeOllama
@@ -237,7 +238,7 @@ class TuiTestCase(AsyncTestCase):
         await pilot.pause()
 
     async def say(self, pilot, text):
-        self.app.query_one("#prompt", Input).value = text
+        self.app.query_one("#prompt", PromptArea).text = text
         await pilot.press("enter")
         await self.settle(pilot)
 
@@ -291,7 +292,7 @@ class TestTui(TuiTestCase):
         self.server.slow_seconds = 1.0
         async with self.app.run_test(size=(120, 40)) as pilot:
             await self.settle(pilot)
-            self.app.query_one("#prompt", Input).value = "slow"
+            self.app.query_one("#prompt", PromptArea).text = "slow"
             await pilot.press("enter")
             await pilot.press("f1")  # open the help dialog while the reply is still coming
             self.assertIsInstance(self.app.screen, InfoScreen)
@@ -306,25 +307,108 @@ class TestTui(TuiTestCase):
     async def test_prompt_tab_completes_command_and_model_name(self):
         async with self.app.run_test(size=(120, 40)) as pilot:
             await self.settle(pilot)
-            prompt = self.app.query_one("#prompt", Input)
-            prompt.value = "/mo"
+            prompt = self.app.query_one("#prompt", PromptArea)
+            prompt.text = "/mo"
             await pilot.pause()
             await pilot.press("tab")
-            self.assertEqual(prompt.value, "/model")
-            prompt.value = "/model nomic"
+            self.assertEqual(prompt.text, "/model")
+            prompt.text = "/model nomic"
             await pilot.pause()
             await pilot.press("tab")
-            self.assertEqual(prompt.value, "/model nomic-embed-text:latest")
+            self.assertEqual(prompt.text, "/model nomic-embed-text:latest")
             self.assertIs(self.app.focused, prompt)
+
+    async def type_text(self, pilot, text):
+        """Type like a user: printable characters as key presses, "\\n" as Ctrl+J."""
+        for char in text:
+            await pilot.press("ctrl+j" if char == "\n" else char)
+
+    async def test_ctrl_j_adds_a_line_and_enter_sends_all_of_it(self):
+        async with self.app.run_test(size=(120, 40)) as pilot:
+            await self.settle(pilot)
+            prompt = self.app.query_one("#prompt", PromptArea)
+            await self.type_text(pilot, "first\nsecond")
+            self.assertEqual(prompt.text, "first\nsecond")
+            self.assertEqual(self.log_texts(), [])  # nothing sent yet
+            await pilot.press("enter")
+            await self.settle(pilot)
+            self.assertEqual(self.log_texts(), ["first\nsecond", "msgs=1 last=first\nsecond"])
+            self.assertEqual(prompt.text, "")
+            self.assertIs(self.app.focused, prompt)
+            self.assertEqual(self.store.get_chat(self.app.chat_id)["title"], "first second")
+
+    async def test_enter_on_empty_or_blank_prompt_sends_nothing(self):
+        async with self.app.run_test(size=(120, 40)) as pilot:
+            await self.settle(pilot)
+            before = len(self.server.requests)
+            await pilot.press("enter")
+            await self.type_text(pilot, "  \n ")
+            await pilot.press("enter")
+            await self.settle(pilot)
+            self.assertEqual(len(self.server.requests), before)
+            self.assertEqual(self.log_texts(), [])
+
+    async def test_pasted_multiline_text_is_kept(self):
+        async with self.app.run_test(size=(120, 40)) as pilot:
+            await self.settle(pilot)
+            prompt = self.app.query_one("#prompt", PromptArea)
+            self.app.post_message(events.Paste("def f():\n    return 1\n"))  # as the terminal does
+            await pilot.pause()
+            self.assertEqual(prompt.text, "def f():\n    return 1\n")
+
+    async def test_multiline_text_starting_with_slash_is_not_a_command(self):
+        async with self.app.run_test(size=(120, 40)) as pilot:
+            await self.settle(pilot)
+            await self.type_text(pilot, "/delete fake:1\nplease explain")
+            await pilot.press("enter")
+            await self.settle(pilot)
+            self.assertNotIsInstance(self.app.screen, ConfirmScreen)
+            self.assertEqual(self.server.requests[-1][1]["messages"][-1]["content"],
+                             "/delete fake:1\nplease explain")
+
+    async def test_prompt_grows_with_text_up_to_a_limit_and_shrinks_after_sending(self):
+        async with self.app.run_test(size=(120, 40)) as pilot:
+            await self.settle(pilot)
+            prompt = self.app.query_one("#prompt", PromptArea)
+            self.assertEqual(prompt.outer_size.height, 3)
+            await self.type_text(pilot, "a\nb\nc")
+            await pilot.pause()
+            self.assertEqual(prompt.outer_size.height, 5)  # 3 lines + border
+            await self.type_text(pilot, "\n" * 20)
+            await pilot.pause()
+            self.assertEqual(prompt.outer_size.height, PromptArea.MAX_ROWS + 2)
+            await pilot.press("enter")
+            await self.settle(pilot)
+            self.assertEqual(prompt.outer_size.height, 3)
+
+    async def test_hint_shows_pending_completion(self):
+        async with self.app.run_test(size=(120, 40)) as pilot:
+            await self.settle(pilot)
+            prompt = self.app.query_one("#prompt", PromptArea)
+            self.assertIn("Ctrl+J", prompt.hint_text)
+            await self.type_text(pilot, "/mo")
+            self.assertEqual(prompt.hint_text, "Tab → /model")
+            await pilot.press("tab")
+            self.assertEqual(prompt.text, "/model")
+            self.assertIn("Ctrl+J", prompt.hint_text)  # fully typed: nothing left to suggest
+
+    async def test_tab_does_not_complete_multiline_text(self):
+        async with self.app.run_test(size=(120, 40)) as pilot:
+            await self.settle(pilot)
+            prompt = self.app.query_one("#prompt", PromptArea)
+            await self.type_text(pilot, "/mo\nx")
+            await pilot.press("tab")
+            self.assertEqual(prompt.text, "/mo\nx")
+            self.assertIsNot(self.app.focused, prompt)
 
     async def test_tab_moves_focus_when_there_is_nothing_to_complete(self):
         async with self.app.run_test(size=(120, 40)) as pilot:
             await self.settle(pilot)
-            prompt = self.app.query_one("#prompt", Input)
-            prompt.value = "hello"
+            prompt = self.app.query_one("#prompt", PromptArea)
+            prompt.text = "hello"
             await pilot.pause()
             await pilot.press("tab")
-            self.assertEqual(prompt.value, "hello")
+            self.assertEqual(prompt.text, "hello")
             self.assertIsNot(self.app.focused, prompt)
 
     async def test_warns_once_per_level_as_context_fills(self):
@@ -430,7 +514,7 @@ class TestTui(TuiTestCase):
         self.server.slow_seconds = 1.5
         async with self.app.run_test(size=(120, 40)) as pilot:
             await self.settle(pilot)
-            self.app.query_one("#prompt", Input).value = "slow"
+            self.app.query_one("#prompt", PromptArea).text = "slow"
             await pilot.press("enter")
             await pilot.pause()
             self.assertTrue(self.app.busy)
@@ -656,7 +740,7 @@ class TestTuiOffline(AsyncTestCase):
             await app.workers.wait_for_complete()
             await pilot.pause()
             self.assertIsNone(app.model)
-            app.query_one("#prompt", Input).value = "hi"
+            app.query_one("#prompt", PromptArea).text = "hi"
             await pilot.press("enter")
             await pilot.pause()
             self.assertEqual(list(app.query("#log .msg")), [])  # refused: no model selected

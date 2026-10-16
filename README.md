@@ -48,8 +48,14 @@ than 100 columns) with three tabs:
   `psutil`, the GPU numbers need `nvidia-smi`; if either is missing the tab says so.
 - **Settings**: system prompt and temperature.
 
-Everything is also available as slash commands, with suggestions while you type (press Tab or → to
-accept): `/help`, `/new`, `/model [name]`, `/pull name`, `/show [name]`, `/delete name`,
+The message box takes several lines: **Enter** sends, **Ctrl+J** starts a new line (Shift+Enter
+does too in terminals that report it), and pasted text keeps its line breaks. The box grows up to
+8 lines. A line above it shows the key help, or the completion for the command you are typing.
+Text is only treated as a `/command` when it is a single line, so pasting code that happens to
+start with `/` is sent as a message.
+
+Everything is also available as slash commands; press **Tab** to complete a command or model
+name: `/help`, `/new`, `/model [name]`, `/pull name`, `/show [name]`, `/delete name`,
 `/system [text]`, `/temp [number]`, `/rename title`, `/quit`.
 Esc stops a running reply, Ctrl+N starts a new chat, Ctrl+Q quits. Replies are rendered as
 Markdown with highlighted code blocks.

@@ -22,12 +22,13 @@ from rich.text import Text
 from textual import on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
+from textual.message import Message
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.suggester import Suggester
 from textual.widgets import (
     Button, Footer, Header, Input, Label, ListItem, ListView,
-    Markdown, ProgressBar, Static, TabbedContent, TabPane,
+    Markdown, ProgressBar, Static, TabbedContent, TabPane, TextArea,
 )
 
 try:
@@ -341,18 +342,67 @@ class CommandSuggester(Suggester):
         return None
 
 
-class PromptInput(Input):
-    """The message box. Tab accepts the suggestion; with nothing to complete it moves focus on."""
+HINT_DEFAULT = "Enter sends · Ctrl+J new line · Tab completes /commands"
 
-    BINDINGS = [Binding("tab", "complete", "Complete", show=False)]
+
+class PromptArea(TextArea):
+    """The message box: Enter sends, Ctrl+J starts a new line, Tab completes a /command.
+
+    It grows with its text (up to MAX_ROWS) and keeps the hint line above it up to date. The hint
+    shows the pending completion, which stands in for the inline ghost text of a one-line Input.
+    """
+
+    MAX_ROWS = 8
+    BINDINGS = [
+        # Priority, because TextArea itself would turn Enter into a newline and Tab into an indent.
+        Binding("enter", "submit", "Send", show=False, priority=True),
+        # Ctrl+J works in every terminal; Shift+Enter only in those that report it separately.
+        Binding("ctrl+j,shift+enter", "newline", "New line", show=False, priority=True),
+        Binding("tab", "complete", "Complete", show=False, priority=True),
+    ]
+
+    class Submitted(Message):
+        def __init__(self, text: str):
+            super().__init__()
+            self.text = text
+
+    def __init__(self, suggester: Suggester, **kwargs):
+        super().__init__(soft_wrap=True, show_line_numbers=False, **kwargs)
+        self.suggester = suggester
+        self.hint_text = HINT_DEFAULT  # what the hint line shows (also read by the tests)
+
+    def action_submit(self) -> None:
+        self.post_message(self.Submitted(self.text))
+
+    def action_newline(self) -> None:
+        self.insert("\n")
+
+    async def _suggestion(self) -> Optional[str]:
+        """A completion for a one-line /command, or None."""
+        text = self.text
+        if not text or "\n" in text:
+            return None
+        suggestion = await self.suggester.get_suggestion(text)
+        return suggestion if suggestion and suggestion != text else None
 
     async def action_complete(self) -> None:
-        suggestion = await self.suggester.get_suggestion(self.value) if self.suggester else None
-        if suggestion and suggestion != self.value:
-            self.value = suggestion
-            self.cursor_position = len(suggestion)
+        suggestion = await self._suggestion()
+        if suggestion:
+            self.load_text(suggestion)
+            self.move_cursor(self.document.end)
         else:
             self.screen.focus_next()
+
+    def _rows(self) -> int:
+        width = max(self.size.width - 4, 20)  # minus border and padding
+        rows = sum(max(1, -(-len(line) // width)) for line in self.text.split("\n"))
+        return min(rows, self.MAX_ROWS)
+
+    async def on_text_area_changed(self) -> None:
+        self.styles.height = self._rows() + 2  # plus the border
+        suggestion = await self._suggestion()
+        self.hint_text = f"Tab → {suggestion}" if suggestion else HINT_DEFAULT
+        self.screen.query_one("#hint", Static).update(Text(self.hint_text))
 
 
 class KeyedItem(ListItem):
@@ -485,7 +535,8 @@ class OllamaTui(App):
     .msg.error { border-left: thick $error; }
     #welcome { color: $text-muted; margin: 1 2; }
     #status { height: 2; padding: 0 1; background: $boost; color: $text-muted; }
-    #prompt { margin: 0 1; }
+    #hint { height: 1; padding: 0 2; color: $text-muted; }
+    #prompt { margin: 0 1; height: 3; border: round $primary; padding: 0 1; }
     #progress { display: none; margin: 1 0 0 0; }
     #progress.visible { display: block; }
     #pull-status { color: $text-muted; }
@@ -568,17 +619,14 @@ class OllamaTui(App):
                 with VerticalScroll(id="log"):
                     yield Static(self._welcome_text(), id="welcome")
                 yield Static("", id="status")
-                yield PromptInput(
-                    placeholder="Message, or /help for commands",
-                    id="prompt",
-                    suggester=CommandSuggester(COMMAND_NAMES, lambda: self.model_names),
-                )
+                yield Static(Text(HINT_DEFAULT), id="hint")
+                yield PromptArea(CommandSuggester(COMMAND_NAMES, lambda: self.model_names), id="prompt")
         yield Footer()
 
     @staticmethod
     def _welcome_text() -> str:
-        return ("Type a message and press Enter. Commands start with / (try /help).\n"
-                "Ctrl+B hides the side panel, Esc stops a running reply, Tab accepts a suggestion.")
+        return ("Type a message and press Enter; Ctrl+J starts a new line. Commands start with / (try /help).\n"
+                "Ctrl+B hides the side panel, Esc stops a running reply, Tab completes a command.")
 
     def on_mount(self) -> None:
         if self.size.width < 100:
@@ -655,8 +703,9 @@ class OllamaTui(App):
     def action_help(self) -> None:
         width = max(len(c) for c in COMMANDS)
         body = "\n".join(f"{cmd.ljust(width)}  {text}" for cmd, text in COMMANDS.items())
-        body += ("\n\nCtrl+B  side panel    Ctrl+N  new chat    Esc  stop reply"
-                 "\nTab or →  accept the suggestion shown in the input    Ctrl+Q  quit")
+        body += ("\n\nEnter  send    Ctrl+J  new line (Shift+Enter in some terminals)"
+                 "\nTab  complete the /command or model name shown above the input"
+                 "\nCtrl+B  side panel    Ctrl+N  new chat    Esc  stop reply    Ctrl+Q  quit")
         self.push_screen(InfoScreen("Commands", body))
 
     # ---- chat log -----------------------------------------------------------------------------
@@ -787,13 +836,13 @@ class OllamaTui(App):
 
     # ---- prompt input and slash commands -------------------------------------------------------
 
-    @on(Input.Submitted, "#prompt")
-    async def _prompt_submitted(self, event: Input.Submitted) -> None:
-        text = event.value.strip()
+    @on(PromptArea.Submitted)
+    async def _prompt_submitted(self, event: PromptArea.Submitted) -> None:
+        text = event.text.strip()
         if not text:
             return
-        event.input.value = ""
-        if text.startswith("/"):
+        self.main_screen.query_one("#prompt", PromptArea).clear()
+        if text.startswith("/") and "\n" not in text:  # pasted multi-line text is never a command
             await self._run_command(text)
         else:
             await self._submit_message(text)
