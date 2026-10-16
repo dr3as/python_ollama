@@ -24,6 +24,12 @@ class FakeOllama:
             def log_message(self, *args):
                 pass
 
+            def handle(self):
+                try:
+                    super().handle()
+                except (BrokenPipeError, ConnectionResetError):
+                    pass  # the client gave up (timeout or cancelled reply) before we answered
+
             def _json(self, obj, status=200):
                 body = (json.dumps(obj) + "\n").encode()
                 self.send_response(status)

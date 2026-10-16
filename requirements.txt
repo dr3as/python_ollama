@@ -1,1 +1,2 @@
 ollama>=0.4
+textual>=2.1
