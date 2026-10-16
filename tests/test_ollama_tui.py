@@ -8,18 +8,21 @@ Three kinds of test live here:
 """
 import asyncio
 import subprocess
+import tempfile
 import unittest
+from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest import mock
 
 from textual import events
-from textual.widgets import Input, ListView, TabbedContent
+from textual.widgets import Button, Input, ListView, RadioButton, RadioSet, SelectionList, TabbedContent
 
 from ollama_client import OllamaClient
+from ollama_compare import ModelRun
 import ollama_tui
 from ollama_tui import (
-    ChatStore, ChoiceScreen, PromptArea, ConfirmScreen, InfoScreen, OllamaTui, format_bytes, format_resources, format_stats,
+    ChatStore, ChoiceScreen, CompareScreen, PromptArea, ConfirmScreen, InfoScreen, OllamaTui, format_bytes, format_resources, format_stats,
     context_percent, is_local_host, parse_nvidia_smi, read_gpus, read_host_stats,
 )
 from tests.fake_ollama import FakeOllama
@@ -66,6 +69,44 @@ class TestChatStore(unittest.TestCase):
         self.store.delete_chat(chat_id)
         self.assertIsNone(self.store.get_chat(chat_id))
         left = self.store._db.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+        self.assertEqual(left, 0)
+
+
+class TestComparisonStore(unittest.TestCase):
+    def setUp(self):
+        self.store = ChatStore(":memory:")
+        self.addCleanup(self.store.close)
+        self.runs = [ModelRun(model="a:1", status="ok", answer="first", total_seconds=1.5),
+                     ModelRun(model="b:1", status="error", error="boom")]
+
+    def test_save_and_get_keep_runs_in_order(self):
+        comparison_id = self.store.save_comparison("why?", "be brief", 0.2, "j:1", self.runs)
+        data = self.store.get_comparison(comparison_id)
+        self.assertEqual((data["prompt"], data["system"], data["temperature"], data["judge_model"]),
+                         ("why?", "be brief", 0.2, "j:1"))
+        self.assertIsNone(data["winner"])
+        self.assertEqual([ModelRun.from_dict(r) for r in data["runs"]], self.runs)
+
+    def test_get_missing_comparison(self):
+        self.assertIsNone(self.store.get_comparison(99))
+
+    def test_list_newest_first(self):
+        first = self.store.save_comparison("one", None, 0.7, None, self.runs)
+        second = self.store.save_comparison("two", None, 0.7, None, self.runs)
+        self.assertEqual([c["id"] for c in self.store.list_comparisons()], [second, first])
+
+    def test_winner_can_be_set_and_cleared(self):
+        comparison_id = self.store.save_comparison("q", None, 0.7, None, self.runs)
+        self.store.set_winner(comparison_id, "a:1")
+        self.assertEqual(self.store.get_comparison(comparison_id)["winner"], "a:1")
+        self.store.set_winner(comparison_id, None)
+        self.assertIsNone(self.store.get_comparison(comparison_id)["winner"])
+
+    def test_delete_removes_the_runs_too(self):
+        comparison_id = self.store.save_comparison("q", None, 0.7, None, self.runs)
+        self.store.delete_comparison(comparison_id)
+        self.assertIsNone(self.store.get_comparison(comparison_id))
+        left = self.store._db.execute("SELECT COUNT(*) FROM comparison_runs").fetchone()[0]
         self.assertEqual(left, 0)
 
 
@@ -751,6 +792,322 @@ class TestResourcesTab(TuiTestCase):
             await app.workers.wait_for_complete()
             await pilot.pause()
             self.assertIn("Cannot reach Ollama", app.resources_text)
+
+
+def table_rows(screen):
+    """The Compare table as {row label: [cell, ...]}."""
+    table = screen.query_one("#cmp-table")
+    return {row[0]: list(row[1:]) for row in (table.get_row_at(i) for i in range(table.row_count))}
+
+
+class TestCompareView(TuiTestCase):
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        self.server.models[:] = ["a:1", "b:1", "c:1"]
+        self.server.running[:] = ["a:1"]
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    async def open_compare(self, pilot):
+        await self.settle(pilot)
+        await pilot.press("f2")
+        await pilot.pause()
+        self.assertIsInstance(self.app.screen, CompareScreen)
+        return self.app.screen
+
+    async def wait_for_run(self, pilot, screen, timeout=20.0):
+        for _ in range(int(timeout / 0.05)):
+            await pilot.pause(0.05)
+            if not screen.running:
+                break
+        await self.settle(pilot)
+
+    async def run_compare(self, pilot, screen, models=("a:1", "b:1"), prompt="hello", judge=None):
+        selection = screen.query_one("#cmp-models", SelectionList)
+        for name in models:
+            selection.select(name)
+        screen.query_one("#cmp-prompt").text = prompt
+        if judge:
+            screen.query_one("#cmp-judge").query(RadioButton)[screen.models.index(judge) + 1].value = True
+        await pilot.press("ctrl+r")
+        await self.wait_for_run(pilot, screen)
+
+    async def test_f2_opens_and_closes_the_view(self):
+        async with self.app.run_test(size=(140, 45)) as pilot:
+            screen = await self.open_compare(pilot)
+            await pilot.press("f2")
+            await pilot.pause()
+            self.assertNotIsInstance(self.app.screen, CompareScreen)
+
+    async def test_compare_command_opens_the_view(self):
+        async with self.app.run_test(size=(140, 45)) as pilot:
+            await self.settle(pilot)
+            await self.say(pilot, "/compare")
+            await pilot.pause()
+            self.assertIsInstance(self.app.screen, CompareScreen)
+
+    async def test_needs_two_installed_models(self):
+        self.server.models[:] = ["only:1"]
+        async with self.app.run_test(size=(140, 45)) as pilot:
+            await self.settle(pilot)
+            with mock.patch.object(OllamaTui, "notify") as notify:
+                await pilot.press("f2")
+                await pilot.pause()
+            self.assertNotIsInstance(self.app.screen, CompareScreen)
+            self.assertIn("at least two", notify.call_args.args[0])
+
+    async def test_cannot_open_while_a_chat_reply_is_streaming(self):
+        async with self.app.run_test(size=(140, 45)) as pilot:
+            await self.settle(pilot)
+            self.app.busy = True
+            await pilot.press("f2")
+            await pilot.pause()
+            self.assertNotIsInstance(self.app.screen, CompareScreen)
+
+    async def test_run_shows_answers_and_numbers_side_by_side(self):
+        async with self.app.run_test(size=(140, 45)) as pilot:
+            screen = await self.open_compare(pilot)
+            await self.run_compare(pilot, screen)
+            self.assertEqual(list(screen.columns), ["a:1", "b:1"])
+            for column in screen.columns.values():
+                self.assertEqual(column.answer_text, "msgs=1 last=hello")
+                self.assertTrue(column.status_text.startswith("ok"))
+            rows = table_rows(screen)
+            self.assertEqual(rows["Status"], ["ok", "ok"])
+            self.assertEqual(rows["Reply tokens"], ["2", "2"])
+            self.assertEqual(rows["Model memory"], ["4.0 GB · 75% GPU ⚠"] * 2)
+            self.assertIn("Done", screen.banner_text)
+            self.assertFalse(screen.running)
+
+    async def test_models_never_share_memory_and_nothing_is_left_loaded(self):
+        async with self.app.run_test(size=(140, 45)) as pilot:
+            screen = await self.open_compare(pilot)
+            await self.run_compare(pilot, screen, models=("a:1", "b:1", "c:1"))
+            self.assertEqual(self.server.max_loaded, 1)
+            self.assertEqual(self.server.running, [])
+
+    async def test_result_is_saved_and_listed_in_history(self):
+        async with self.app.run_test(size=(140, 45)) as pilot:
+            screen = await self.open_compare(pilot)
+            await self.run_compare(pilot, screen, prompt="why is the sky blue")
+            saved = self.store.get_comparison(screen.comparison_id)
+            self.assertEqual(saved["prompt"], "why is the sky blue")
+            self.assertEqual([r["model"] for r in saved["runs"]], ["a:1", "b:1"])
+            self.assertEqual(len(screen.query_one("#cmp-history", ListView).children), 1)
+
+    async def test_uses_the_chats_system_prompt_and_temperature(self):
+        async with self.app.run_test(size=(140, 45)) as pilot:
+            await self.settle(pilot)
+            await self.say(pilot, "/system be brief")
+            await self.say(pilot, "/temp 0.3")
+            screen = await self.open_compare(pilot)
+            await self.run_compare(pilot, screen)
+            body = [b for p, b in self.server.requests if p == "/api/chat"][-1]
+            self.assertEqual(body["messages"][0], {"role": "system", "content": "be brief"})
+            self.assertEqual(body["options"]["temperature"], 0.3)
+
+    async def test_run_needs_two_models_and_a_prompt(self):
+        async with self.app.run_test(size=(140, 45)) as pilot:
+            screen = await self.open_compare(pilot)
+            before = len(self.server.requests)
+            with mock.patch.object(CompareScreen, "notify") as notify:
+                screen.query_one("#cmp-prompt").text = "hello"
+                await pilot.press("ctrl+r")
+                self.assertIn("at least two", notify.call_args.args[0])
+                screen.query_one("#cmp-models", SelectionList).select_all()
+                screen.query_one("#cmp-prompt").text = "  "
+                await pilot.press("ctrl+r")
+                self.assertIn("prompt", notify.call_args.args[0])
+            self.assertEqual(len(self.server.requests), before)
+
+    async def test_one_failing_model_still_shows_the_others(self):
+        self.server.bad_models.add("b:1")
+        async with self.app.run_test(size=(140, 45)) as pilot:
+            screen = await self.open_compare(pilot)
+            await self.run_compare(pilot, screen, models=("a:1", "b:1", "c:1"))
+            self.assertEqual(table_rows(screen)["Status"][0], "ok")
+            self.assertTrue(table_rows(screen)["Status"][1].startswith("error:"))
+            self.assertEqual(table_rows(screen)["Status"][2], "ok")
+            self.assertIn("model failed to load", screen.columns["b:1"].status_text)
+
+    async def test_cpu_spill_is_flagged_in_the_table(self):
+        self.server.sizes["b:1"] = (10_000_000_000, 6_000_000_000)
+        async with self.app.run_test(size=(140, 45)) as pilot:
+            screen = await self.open_compare(pilot)
+            await self.run_compare(pilot, screen)
+            self.assertEqual(table_rows(screen)["Model memory"][1], "10.0 GB · 60% GPU ⚠")
+
+    async def test_esc_stops_the_run_and_skips_the_rest(self):
+        self.server.delays["a:1"] = 0.6
+        async with self.app.run_test(size=(140, 45)) as pilot:
+            screen = await self.open_compare(pilot)
+            selection = screen.query_one("#cmp-models", SelectionList)
+            selection.select("a:1")
+            selection.select("b:1")
+            screen.query_one("#cmp-prompt").text = "hello"
+            await pilot.press("ctrl+r")
+            await pilot.pause(0.2)
+            self.assertTrue(screen.running)
+            await pilot.press("escape")
+            await self.wait_for_run(pilot, screen)
+            self.assertEqual(table_rows(screen)["Status"], ["stopped", "skipped"])
+            self.assertIn("Stopped", screen.banner_text)
+            self.assertEqual(self.server.running, [])
+
+    async def test_cannot_leave_while_running(self):
+        self.server.delays["a:1"] = 0.6
+        async with self.app.run_test(size=(140, 45)) as pilot:
+            screen = await self.open_compare(pilot)
+            selection = screen.query_one("#cmp-models", SelectionList)
+            selection.select("a:1")
+            selection.select("b:1")
+            screen.query_one("#cmp-prompt").text = "hello"
+            await pilot.press("ctrl+r")
+            await pilot.pause(0.2)
+            await pilot.press("f2")
+            await pilot.pause()
+            self.assertIs(self.app.screen, screen)
+            await pilot.press("escape")
+            await self.wait_for_run(pilot, screen)
+
+    async def test_pick_a_winner_and_change_your_mind(self):
+        async with self.app.run_test(size=(140, 45)) as pilot:
+            screen = await self.open_compare(pilot)
+            await self.run_compare(pilot, screen)
+            screen.columns["b:1"].query_one(".cmp-pick", Button).press()
+            await pilot.pause()
+            self.assertTrue(screen.columns["b:1"].has_class("winner"))
+            self.assertFalse(screen.columns["a:1"].has_class("winner"))
+            self.assertEqual(self.store.get_comparison(screen.comparison_id)["winner"], "b:1")
+            screen.columns["b:1"].query_one(".cmp-pick", Button).press()
+            await pilot.pause()
+            self.assertFalse(screen.columns["b:1"].has_class("winner"))
+            self.assertIsNone(self.store.get_comparison(screen.comparison_id)["winner"])
+
+    async def test_judge_scores_appear_in_columns_and_table(self):
+        self.server.judge_reply = ('{"A": {"score": 9, "reason": "clear"},'
+                                   ' "B": {"score": 2, "reason": "vague"}}')
+        async with self.app.run_test(size=(140, 45)) as pilot:
+            screen = await self.open_compare(pilot)
+            await self.run_compare(pilot, screen, judge="c:1")
+            scores = sorted(run.judge_score for run in screen.runs)
+            self.assertEqual(scores, [2.0, 9.0])
+            self.assertIn("Judge score", table_rows(screen))
+            self.assertTrue(any("judge:" in c.status_text for c in screen.columns.values()))
+            self.assertEqual(self.store.get_comparison(screen.comparison_id)["judge_model"], "c:1")
+            self.assertEqual(self.server.max_loaded, 1)
+
+    async def test_unreadable_judge_reply_is_reported(self):
+        self.server.judge_reply = "no idea"
+        async with self.app.run_test(size=(140, 45)) as pilot:
+            screen = await self.open_compare(pilot)
+            with mock.patch.object(CompareScreen, "notify") as notify:
+                await self.run_compare(pilot, screen, judge="c:1")
+            self.assertIn("Judging did not work", notify.call_args.args[0])
+            self.assertNotIn("Judge score", table_rows(screen))
+
+    async def test_gpu_numbers_are_added_on_this_machine(self):
+        calls = []
+
+        def reader():
+            calls.append(1)
+            return [{"name": "GPU", "util_percent": 70.0, "vram_used": 1_000_000_000 * len(calls),
+                     "vram_total": 8_000_000_000, "temperature": 50.0}]
+
+        with mock.patch.object(ollama_tui, "read_gpus", reader):
+            async with self.app.run_test(size=(140, 45)) as pilot:
+                screen = await self.open_compare(pilot)
+                await self.run_compare(pilot, screen)
+                rows = table_rows(screen)
+        self.assertIn("GPU memory used", rows)
+        self.assertEqual(rows["GPU peak load"], ["70%", "70%"])
+
+    async def test_no_gpu_numbers_when_ollama_is_remote(self):
+        self.app.is_local = False
+        with mock.patch.object(ollama_tui, "read_gpus", side_effect=AssertionError("must not run")):
+            async with self.app.run_test(size=(140, 45)) as pilot:
+                screen = await self.open_compare(pilot)
+                await self.run_compare(pilot, screen)
+                self.assertNotIn("GPU memory used", table_rows(screen))
+
+    async def select_history_item(self, pilot, screen):
+        screen.query_one(TabbedContent).active = "cmp-tab-history"
+        await pilot.pause()
+        history = screen.query_one("#cmp-history", ListView)
+        history.focus()
+        history.index = 0
+        await pilot.pause()
+        await pilot.press("enter")
+        await pilot.pause()
+
+    async def test_old_comparison_can_be_reopened_from_history(self):
+        runs = [ModelRun(model="x:1", status="ok", answer="old answer", total_seconds=2.0,
+                         tokens_per_second=10.0),
+                ModelRun(model="y:1", status="ok", answer="other answer", total_seconds=3.0,
+                         tokens_per_second=8.0)]
+        comparison_id = self.store.save_comparison("old question", None, 0.7, None, runs)
+        self.store.set_winner(comparison_id, "y:1")
+        async with self.app.run_test(size=(140, 45)) as pilot:
+            screen = await self.open_compare(pilot)
+            await self.select_history_item(pilot, screen)
+            self.assertEqual(screen.query_one("#cmp-prompt").text, "old question")
+            self.assertEqual(screen.columns["x:1"].answer_text, "old answer")
+            self.assertTrue(screen.columns["y:1"].has_class("winner"))
+            self.assertEqual(table_rows(screen)["Total time"], ["2.0 s ★", "3.0 s"])
+
+    async def test_export_writes_markdown(self):
+        async with self.app.run_test(size=(140, 45)) as pilot:
+            screen = await self.open_compare(pilot)
+            screen.export_dir = Path(self.tmp.name)
+            await self.run_compare(pilot, screen, prompt="export me")
+            screen.query_one("#cmp-export", Button).press()
+            await pilot.pause()
+            text = (Path(self.tmp.name) / f"compare-{screen.comparison_id}.md").read_text()
+            self.assertIn("> export me", text)
+            self.assertIn("### a:1", text)
+            self.assertIn("| Total time |", text)
+
+    async def test_export_without_a_comparison_explains_itself(self):
+        async with self.app.run_test(size=(140, 45)) as pilot:
+            screen = await self.open_compare(pilot)
+            screen.export_dir = Path(self.tmp.name)
+            with mock.patch.object(CompareScreen, "notify") as notify:
+                screen.query_one("#cmp-export", Button).press()
+                await pilot.pause()
+            self.assertIn("Run a comparison", notify.call_args.args[0])
+            self.assertEqual(list(Path(self.tmp.name).iterdir()), [])
+
+    async def test_delete_asks_first_then_removes_the_comparison(self):
+        async with self.app.run_test(size=(140, 45)) as pilot:
+            screen = await self.open_compare(pilot)
+            await self.run_compare(pilot, screen)
+            screen.query_one(TabbedContent).active = "cmp-tab-history"
+            await pilot.pause()
+            history = screen.query_one("#cmp-history", ListView)
+            history.index = 0
+            await pilot.pause()
+            screen.query_one("#cmp-delete", Button).press()
+            await pilot.pause()
+            self.assertIsInstance(self.app.screen, ConfirmScreen)
+            await pilot.press("n")
+            await pilot.pause()
+            self.assertEqual(len(self.store.list_comparisons()), 1)
+            screen.query_one("#cmp-delete", Button).press()
+            await pilot.pause()
+            await pilot.press("y")
+            await pilot.pause()
+            self.assertEqual(self.store.list_comparisons(), [])
+            self.assertEqual(screen.runs, [])
+
+    async def test_chat_still_works_after_a_comparison_unloaded_everything(self):
+        async with self.app.run_test(size=(140, 45)) as pilot:
+            screen = await self.open_compare(pilot)
+            await self.run_compare(pilot, screen)
+            await pilot.press("f2")
+            await pilot.pause()
+            self.assertNotIsInstance(self.app.screen, CompareScreen)
+            await self.say(pilot, "still there?")
+            self.assertEqual(self.log_texts()[-1], "msgs=1 last=still there?")
 
 
 class TestTuiOffline(AsyncTestCase):

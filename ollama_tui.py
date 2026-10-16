@@ -10,8 +10,10 @@ How the file is organised, top to bottom:
    format_resources, read_gpus, ...). They take plain data and return plain data, which makes
    them easy to test without starting the app.
 4. Small widgets and dialogs (PromptArea, AssistantMessage, ChoiceScreen, ...).
-5. OllamaTui: the application itself.
-6. build_parser() and main(): the command line entry point.
+5. The Compare view (ResultColumn, CompareScreen). It collects the choices and shows the
+   results; the comparison itself runs in ollama_compare.py.
+6. OllamaTui: the application itself.
+7. build_parser() and main(): the command line entry point.
 
 The one idea to understand before reading OllamaTui is the THREADING MODEL:
 
@@ -25,6 +27,7 @@ The one idea to understand before reading OllamaTui is the THREADING MODEL:
 """
 import argparse
 import ipaddress
+import json
 import os
 import shutil
 import socket
@@ -45,12 +48,14 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.message import Message
 from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.screen import ModalScreen
+from textual.screen import ModalScreen, Screen
 from textual.suggester import Suggester
 from textual.widgets import (
-    Button, Footer, Header, Input, Label, ListItem, ListView,
-    Markdown, ProgressBar, Static, TabbedContent, TabPane, TextArea,
+    Button, DataTable, Footer, Header, Input, Label, ListItem, ListView,
+    Markdown, ProgressBar, RadioButton, RadioSet, SelectionList, Static, TabbedContent,
+    TabPane, TextArea,
 )
+from textual.widgets.selection_list import Selection
 
 # psutil is optional. Importing it in a try block lets the app start without it; code that needs
 # it checks `psutil is None` (see read_host_stats).
@@ -62,6 +67,8 @@ except ImportError:
 from ollama_client import (
     DEFAULT_HOST, DEFAULT_RETRIES, DEFAULT_TIMEOUT, ChatSession, OllamaClient,
 )
+# format_bytes lives in ollama_compare (which this module already depends on) so there is one copy.
+from ollama_compare import ModelRun, compare_models, comparison_markdown, format_bytes, metric_rows
 
 APP_NAME = "ollama_tui"
 TITLE_LENGTH = 50  # chat titles (taken from the first message) are cut to this many characters
@@ -124,6 +131,24 @@ class ChatStore:
                 created_at TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS messages_chat ON messages(chat_id, id);
+            -- Model comparisons. Each run is stored as one JSON text (everything ModelRun holds),
+            -- so adding a metric later does not need a database migration.
+            CREATE TABLE IF NOT EXISTS comparisons (
+                id INTEGER PRIMARY KEY,
+                prompt TEXT NOT NULL,
+                system TEXT,
+                temperature REAL NOT NULL,
+                judge_model TEXT,
+                winner TEXT,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS comparison_runs (
+                id INTEGER PRIMARY KEY,
+                comparison_id INTEGER NOT NULL REFERENCES comparisons(id) ON DELETE CASCADE,
+                position INTEGER NOT NULL,
+                model TEXT NOT NULL,
+                data TEXT NOT NULL
+            );
         """)
 
     def close(self) -> None:
@@ -193,6 +218,55 @@ class ChatStore:
         """Delete a chat; its messages go too (ON DELETE CASCADE)."""
         with self._db:
             self._db.execute("DELETE FROM chats WHERE id = ?", (chat_id,))
+
+    # ---- model comparisons (see ollama_compare.py) ----
+
+    def save_comparison(self, prompt: str, system: Optional[str], temperature: float,
+                        judge_model: Optional[str], runs: List[ModelRun]) -> int:
+        """Store a finished comparison with all its runs and return its id."""
+        with self._db:
+            cur = self._db.execute(
+                "INSERT INTO comparisons (prompt, system, temperature, judge_model, created_at)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (prompt, system, temperature, judge_model, _now()),
+            )
+            self._db.executemany(
+                "INSERT INTO comparison_runs (comparison_id, position, model, data) VALUES (?, ?, ?, ?)",
+                [(cur.lastrowid, position, run.model, json.dumps(run.to_dict()))
+                 for position, run in enumerate(runs)],
+            )
+        return cur.lastrowid
+
+    def list_comparisons(self) -> List[Dict[str, Any]]:
+        """All saved comparisons, newest first."""
+        rows = self._db.execute(
+            "SELECT id, prompt, winner, created_at FROM comparisons ORDER BY created_at DESC, id DESC"
+        )
+        return [dict(r) for r in rows]
+
+    def get_comparison(self, comparison_id: int) -> Optional[Dict[str, Any]]:
+        """One comparison with its runs (as dicts, in the order they ran), or None."""
+        row = self._db.execute("SELECT * FROM comparisons WHERE id = ?", (comparison_id,)).fetchone()
+        if row is None:
+            return None
+        comparison = dict(row)
+        comparison["runs"] = [
+            json.loads(r["data"]) for r in self._db.execute(
+                "SELECT data FROM comparison_runs WHERE comparison_id = ? ORDER BY position",
+                (comparison_id,),
+            )
+        ]
+        return comparison
+
+    def set_winner(self, comparison_id: int, model: Optional[str]) -> None:
+        """Remember which model the user preferred (None clears the choice)."""
+        with self._db:
+            self._db.execute("UPDATE comparisons SET winner = ? WHERE id = ?", (model, comparison_id))
+
+    def delete_comparison(self, comparison_id: int) -> None:
+        """Delete a comparison; its runs go too (ON DELETE CASCADE)."""
+        with self._db:
+            self._db.execute("DELETE FROM comparisons WHERE id = ?", (comparison_id,))
 
 
 # ---- status bar and Resources tab: plain functions ------------------------------------------------
@@ -304,11 +378,6 @@ def read_gpus() -> Optional[List[Dict[str, Any]]]:
     except (OSError, subprocess.SubprocessError):
         return None
     return parse_nvidia_smi(result.stdout) or None  # an empty list also means "no GPU data"
-
-
-def format_bytes(size: float) -> str:
-    """5_200_000_000 -> "5.2 GB"; small sizes are shown in MB."""
-    return f"{size / 1e9:.1f} GB" if size >= 1e8 else f"{size / 1e6:.0f} MB"
 
 
 def _bar(percent: Optional[float], width: int = 10) -> str:
@@ -595,6 +664,364 @@ class ConfirmScreen(ModalScreen[bool]):
         self.dismiss(answer)
 
 
+# ---- the Compare view ------------------------------------------------------------------------------
+#
+# A comparison runs the same prompt on several models, one after another (the logic is in
+# ollama_compare.py). This screen collects the choices, starts that in a worker thread and shows
+# the answers side by side with a table of numbers underneath.
+
+
+class ResultColumn(Vertical):
+    """One model's column in the Compare view: its name, a status line, the answer, a pick button."""
+
+    def __init__(self, model: str):
+        super().__init__(classes="cmp-column")
+        self.model = model
+        self.status_text = ""  # also read by the tests
+        self.answer_text = ""
+
+    def compose(self) -> ComposeResult:
+        yield Label(self.model, classes="cmp-col-title")
+        yield Static("waiting...", classes="cmp-col-status")
+        with VerticalScroll(classes="cmp-col-scroll"):
+            yield AssistantMessage("", classes="cmp-col-answer")
+        yield Button("★ I prefer this one", classes="cmp-pick")
+
+    def set_status(self, text: str) -> None:
+        self.status_text = text
+        self.query_one(".cmp-col-status", Static).update(Text(text))
+
+    async def set_answer(self, text: str) -> None:
+        self.answer_text = text
+        await self.query_one(".cmp-col-answer", AssistantMessage).update(text)
+
+    def mark_winner(self, is_winner: bool) -> None:
+        self.set_class(is_winner, "winner")
+        self.query_one(".cmp-pick", Button).label = "★ Your pick" if is_winner else "★ I prefer this one"
+
+
+def run_summary(run: ModelRun) -> str:
+    """The status line under a model's name once it has finished, e.g. "ok · 12.3 s · 41.0 tok/s"."""
+    if run.status == "error":
+        return f"error: {run.error}"
+    if run.status in ("waiting", "skipped"):
+        return run.status
+    text = f"{run.status} · {run.total_seconds or 0:.1f} s · {run.tokens_per_second:.1f} tok/s"
+    if run.judge_score is not None:
+        text += f"\njudge: {run.judge_score:.0f}/10 {run.judge_reason}".rstrip()
+    return text
+
+
+class CompareScreen(Screen):
+    """Pick models, type a prompt, press Ctrl+R: the answers and numbers appear side by side."""
+
+    # A screen's CSS applies to the whole app, so every id here starts with "cmp-" to avoid
+    # clashing with the chat screen's rules.
+    CSS = """
+    #cmp-body { height: 1fr; }
+    #cmp-side { width: 38; border-right: solid $primary; padding: 0 1; }
+    #cmp-side SelectionList { height: 8; }
+    #cmp-judge-box { height: 9; }
+    #cmp-info { color: $text-muted; margin: 1 0; }
+    #cmp-history { height: 1fr; }
+    #cmp-main { width: 1fr; padding: 0 1; }
+    #cmp-prompt { height: 5; }
+    #cmp-banner { height: 1; color: $text-muted; }
+    #cmp-columns { height: 1fr; overflow-x: auto; }
+    .cmp-column { width: 1fr; min-width: 34; border: round $primary-darken-2; padding: 0 1; }
+    .cmp-column.winner { border: thick $success; }
+    .cmp-col-title { text-style: bold; }
+    .cmp-col-status { color: $text-muted; height: auto; min-height: 1; }
+    .cmp-col-scroll { height: 1fr; }
+    .cmp-pick { width: 100%; }
+    #cmp-table { height: 15; }
+    .buttons { height: auto; }
+    """
+
+    BINDINGS = [
+        Binding("ctrl+r", "run", "Run"),
+        Binding("f2", "back", "Back to chat"),
+        Binding("escape", "stop_or_back", "Stop / back"),
+    ]
+
+    def __init__(self, models: List[str]):
+        super().__init__()
+        self.models = models
+        self.running = False
+        self.cancel = threading.Event()  # set by Esc; checked by the worker between chunks
+        self.runs: List[ModelRun] = []
+        self.prompt = ""
+        self.judge_model: Optional[str] = None
+        self.comparison_id: Optional[int] = None  # None until the comparison has been saved
+        self.winner: Optional[str] = None
+        self.columns: Dict[str, ResultColumn] = {}
+        self.banner_text = ""  # also read by the tests
+        self.export_dir: Optional[Path] = None  # where /export writes; None means the current folder
+        self._last_paint = 0.0
+
+    @property
+    def store(self) -> ChatStore:
+        return self.app.store
+
+    # ---- layout ----
+
+    def compose(self) -> ComposeResult:
+        with Horizontal(id="cmp-body"):
+            with Vertical(id="cmp-side"):
+                with TabbedContent():
+                    with TabPane("Setup", id="cmp-tab-setup"):
+                        yield Label("Models to compare (Space ticks)")
+                        yield SelectionList(*[Selection(name, name) for name in self.models],
+                                            id="cmp-models")
+                        yield Label("Judge (optional)")
+                        with VerticalScroll(id="cmp-judge-box"):
+                            with RadioSet(id="cmp-judge"):
+                                yield RadioButton("No judge", value=True)
+                                for name in self.models:
+                                    yield RadioButton(name)
+                        yield Static(self._info_text(), id="cmp-info")
+                        yield Button("Run (Ctrl+R)", id="cmp-run", variant="primary")
+                    with TabPane("History", id="cmp-tab-history"):
+                        yield ListView(id="cmp-history")
+                        with Horizontal(classes="buttons"):
+                            yield Button("Export", id="cmp-export")
+                            yield Button("Delete", id="cmp-delete", variant="error")
+            with Vertical(id="cmp-main"):
+                yield Label("Prompt (Enter = new line, Ctrl+R = run)")
+                yield TextArea(id="cmp-prompt")
+                yield Static("", id="cmp-banner")
+                yield Horizontal(id="cmp-columns")
+                yield DataTable(id="cmp-table", zebra_stripes=True, cursor_type="none")
+        yield Footer()
+
+    def _info_text(self) -> str:
+        session = self.app.session
+        gpu = "on" if self.app.is_local else "off (Ollama is not on this machine)"
+        return (f"Uses the chat's settings:\n  system prompt: {'set' if session.system else 'none'}"
+                f"\n  temperature: {session.temperature:g}\n  GPU sampling: {gpu}")
+
+    def on_mount(self) -> None:
+        self._set_banner("Each model runs alone: all loaded models are unloaded before it starts.")
+        self._refresh_history()
+        self.query_one("#cmp-prompt", TextArea).focus()
+
+    def _set_banner(self, text: str) -> None:
+        self.banner_text = text
+        self.query_one("#cmp-banner", Static).update(Text(text))
+
+    # ---- leaving ----
+
+    def action_back(self) -> None:
+        if self.running:
+            self.notify("A comparison is running. Press Esc to stop it first.", severity="warning")
+            return
+        self.dismiss()
+
+    def action_stop_or_back(self) -> None:
+        if self.running:
+            self.cancel.set()
+            self._set_banner("Stopping...")
+        else:
+            self.dismiss()
+
+    # ---- running ----
+
+    @on(Button.Pressed, "#cmp-run")
+    async def action_run(self) -> None:
+        if self.running:
+            self.notify("A comparison is already running.", severity="warning")
+            return
+        models = list(self.query_one("#cmp-models", SelectionList).selected)
+        prompt = self.query_one("#cmp-prompt", TextArea).text.strip()
+        if len(models) < 2:
+            self.notify("Tick at least two models.", severity="warning")
+            return
+        if not prompt:
+            self.notify("Type a prompt first.", severity="warning")
+            return
+        judge_index = self.query_one("#cmp-judge", RadioSet).pressed_index
+        self.judge_model = self.models[judge_index - 1] if judge_index > 0 else None
+        self.prompt = prompt
+        self.comparison_id = None
+        self.winner = None
+        self.runs = [ModelRun(model=m) for m in models]
+        self.cancel.clear()
+        self.running = True
+        await self._build_columns()
+        self._update_table()
+        self._set_banner("Starting...")
+        session = self.app.session
+        self._compare_worker(prompt, models, session.system, session.temperature, self.judge_model)
+
+    @work(thread=True, exit_on_error=False)
+    def _compare_worker(self, prompt: str, models: List[str], system: Optional[str],
+                        temperature: float, judge_model: Optional[str]) -> None:
+        """Runs in a thread: compare_models blocks for minutes. Results go to the UI via call_from_thread."""
+        call = self.app.call_from_thread
+
+        def on_text(model: str, text: str, chunks: int, seconds: float) -> None:
+            now = time.monotonic()
+            if now - self._last_paint >= 0.1:  # repaint at most ten times a second
+                self._last_paint = now
+                call(self._show_text, model, text)
+
+        gpu_reader = read_gpus if self.app.is_local and read_gpus() else None
+        try:
+            runs, problem = compare_models(
+                self.app.client, prompt, models, system=system, temperature=temperature,
+                cancel=self.cancel, gpu_reader=gpu_reader, judge_model=judge_model,
+                on_status=lambda model, text: call(self._show_status, model, text),
+                on_text=on_text,
+                on_run=lambda run: call(self._run_finished, run),
+                on_judging=lambda name: call(self._set_banner, f"Judging the answers with {name}..."),
+            )
+        except Exception as e:
+            call(self._failed, e)
+            return
+        call(self._all_finished, runs, problem)
+
+    async def _build_columns(self) -> None:
+        container = self.query_one("#cmp-columns", Horizontal)
+        await container.remove_children()
+        self.columns = {}
+        for run in self.runs:
+            column = ResultColumn(run.model)
+            self.columns[run.model] = column
+            await container.mount(column)
+            await self._fill_column(column, run)
+
+    async def _fill_column(self, column: ResultColumn, run: ModelRun) -> None:
+        column.set_status(run_summary(run))
+        await column.set_answer(run.answer)
+        column.mark_winner(run.model == self.winner)
+
+    def _show_status(self, model: str, text: str) -> None:
+        self._set_banner(f"{model}: {text}")
+        self.columns[model].set_status(text)
+
+    async def _show_text(self, model: str, text: str) -> None:
+        await self.columns[model].set_answer(text)
+
+    async def _run_finished(self, run: ModelRun) -> None:
+        """One model is done: show its final answer and the numbers collected so far."""
+        for index, existing in enumerate(self.runs):
+            if existing.model == run.model:
+                self.runs[index] = run
+        await self._fill_column(self.columns[run.model], run)
+        self._update_table()
+
+    async def _all_finished(self, runs: List[ModelRun], judge_problem: Optional[str]) -> None:
+        self.runs = runs
+        self.running = False
+        for run in runs:
+            await self._fill_column(self.columns[run.model], run)  # the judge scores arrived late
+        self._update_table()
+        self.comparison_id = self.store.save_comparison(
+            self.prompt, self.app.session.system, self.app.session.temperature,
+            self.judge_model, runs,
+        )
+        self._refresh_history()
+        if judge_problem:
+            self.notify(f"Judging did not work: {judge_problem}", severity="warning", timeout=10)
+        stopped = any(r.status in ("stopped", "skipped") for r in runs)
+        self._set_banner(("Stopped. " if stopped else "Done. ")
+                         + "Press a model's ★ button to record which answer you preferred.")
+
+    def _failed(self, error: Exception) -> None:
+        self.running = False
+        self._set_banner("The comparison failed.")
+        self.notify(_describe(error), severity="error", timeout=10)
+
+    def _update_table(self) -> None:
+        table = self.query_one("#cmp-table", DataTable)
+        table.clear(columns=True)
+        table.add_column("")
+        for run in self.runs:
+            table.add_column(run.model)
+        for label, cells in metric_rows(self.runs):
+            table.add_row(label, *cells)
+
+    # ---- the winner ----
+
+    @on(Button.Pressed, ".cmp-pick")
+    def _pick_pressed(self, event: Button.Pressed) -> None:
+        column = event.button.parent
+        if self.running or self.comparison_id is None:
+            self.notify("Wait until the comparison has finished.", severity="warning")
+            return
+        self.winner = None if self.winner == column.model else column.model  # pressing again clears it
+        for other in self.columns.values():
+            other.mark_winner(other.model == self.winner)
+        self.store.set_winner(self.comparison_id, self.winner)
+        self._refresh_history()
+
+    # ---- history, export, delete ----
+
+    def _refresh_history(self) -> None:
+        view = self.query_one("#cmp-history", ListView)
+        view.clear()
+        view.extend(
+            KeyedItem(f"{c['prompt'].splitlines()[0][:24]}  ({c['created_at'][:10]})", c["id"])
+            for c in self.store.list_comparisons() if c["prompt"].strip()
+        )
+
+    @on(ListView.Selected, "#cmp-history")
+    async def _history_selected(self, event: ListView.Selected) -> None:
+        if self.running:
+            self.notify("Wait for the running comparison to finish.", severity="warning")
+            return
+        data = self.store.get_comparison(event.item.key)
+        if data is None:
+            return
+        self.comparison_id = data["id"]
+        self.prompt = data["prompt"]
+        self.winner = data["winner"]
+        self.judge_model = data["judge_model"]
+        self.runs = [ModelRun.from_dict(r) for r in data["runs"]]
+        self.query_one("#cmp-prompt", TextArea).load_text(self.prompt)
+        await self._build_columns()
+        self._update_table()
+        self._set_banner(f"Saved comparison from {data['created_at']} UTC.")
+
+    @on(Button.Pressed, "#cmp-export")
+    def _export_pressed(self) -> None:
+        if self.comparison_id is None:
+            self.notify("Run a comparison or open one from the History tab first.", severity="warning")
+            return
+        data = self.store.get_comparison(self.comparison_id)
+        folder = self.export_dir or Path.cwd()
+        path = folder / f"compare-{self.comparison_id}.md"
+        try:
+            path.write_text(comparison_markdown(data), encoding="utf-8")
+        except OSError as e:
+            self.notify(f"Could not write {path}: {e}", severity="error")
+            return
+        self.notify(f"Saved {path}")
+
+    @on(Button.Pressed, "#cmp-delete")
+    def _delete_pressed(self) -> None:
+        item = self.query_one("#cmp-history", ListView).highlighted_child
+        if not isinstance(item, KeyedItem):
+            self.notify("Select a comparison in the list first.", severity="warning")
+            return
+        comparison_id = item.key
+
+        async def answered(yes: Optional[bool]) -> None:
+            if not yes:
+                return
+            self.store.delete_comparison(comparison_id)
+            if comparison_id == self.comparison_id:
+                self.comparison_id = None
+                self.runs = []
+                self.winner = None
+                await self._build_columns()
+                self._update_table()
+            self._refresh_history()
+
+        self.app.push_screen(ConfirmScreen("Delete this comparison?"), answered)
+
+
+
 COMMANDS = {
     "/help": "show this list",
     "/new": "start a new chat (keeps model, system prompt, temperature)",
@@ -605,6 +1032,7 @@ COMMANDS = {
     "/system [text]": "set the system prompt (empty clears it)",
     "/temp [number]": "show or set the temperature (0-2)",
     "/rename title": "rename the current chat",
+    "/compare": "compare several models on one prompt (also F2)",
     "/quit": "exit",
 }
 # "/model [name]" -> "/model": keep only the first word, deduplicate with a set, then sort.
@@ -625,6 +1053,7 @@ class OllamaTui(App):
       Resources tab       _poll_resources() -> _read_resources() (thread) -> _show_resources()
       models tab          _load_models(), _pull(), _show(), _delete_model()
       chats tab           _load_chat(), _refresh_chats()
+      compare             action_compare() opens CompareScreen (F2 or /compare)
     """
 
     TITLE = "Ollama"
@@ -668,6 +1097,7 @@ class OllamaTui(App):
         Binding("ctrl+n", "new_chat", "New chat"),
         Binding("escape", "cancel", "Stop reply"),
         Binding("f1", "help", "Help"),
+        Binding("f2", "compare", "Compare models"),
     ]
 
     def __init__(self, client: OllamaClient, store: ChatStore, model: Optional[str] = None,
@@ -823,12 +1253,22 @@ class OllamaTui(App):
         if self.busy:
             self._cancel.set()  # the streaming thread notices this on its next chunk
 
+    def action_compare(self) -> None:
+        """Open the Compare view (F2 or /compare)."""
+        if not self._guard():
+            return
+        if len(self.model_names) < 2:
+            self.notify("Comparing needs at least two installed models (see /pull).", severity="warning")
+            return
+        self.push_screen(CompareScreen(list(self.model_names)))
+
     def action_help(self) -> None:
         width = max(len(c) for c in COMMANDS)
         body = "\n".join(f"{cmd.ljust(width)}  {text}" for cmd, text in COMMANDS.items())
         body += ("\n\nEnter  send    Ctrl+J  new line (Shift+Enter in some terminals)"
                  "\nTab  complete the /command or model name shown above the input"
-                 "\nCtrl+B  side panel    Ctrl+N  new chat    Esc  stop reply    Ctrl+Q  quit")
+                 "\nCtrl+B  side panel    Ctrl+N  new chat    Esc  stop reply    Ctrl+Q  quit"
+                 "\nF2  compare models side by side (Ctrl+R runs, Esc stops, F2 goes back)")
         self.push_screen(InfoScreen("Commands", body))
 
     # ---- chat log -----------------------------------------------------------------------------
@@ -1012,6 +1452,8 @@ class OllamaTui(App):
             self._apply_system(arg)
         elif name == "/temp":
             self._apply_temperature(arg)
+        elif name == "/compare":
+            self.action_compare()
         elif name == "/rename":
             if self._has_arg(arg, "/rename TITLE"):
                 self._rename_chat(arg)

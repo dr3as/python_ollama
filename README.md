@@ -68,6 +68,45 @@ approximate: Ollama reports only the tokens it evaluated for the request, which 
 than the whole conversation when part of it was cached. The context total is the window the
 model is actually running with, read from Ollama's `/api/ps`.
 
+### Comparing models (F2 or `/compare`)
+
+Press **F2** for a full-screen view that runs one prompt on several models and shows the
+answers side by side with a table of numbers. Tick two or more installed models, type a prompt
+(Enter = new line), press **Ctrl+R**. It uses the chat's current system prompt and temperature.
+
+**One model at a time, from an empty GPU.** Before each model, every loaded model is unloaded
+and the app waits until Ollama's `/api/ps` confirms the memory is free. After the run the model
+is unloaded too. This matters on a small GPU (8 GB): a second model loaded next to the first
+would spill onto the CPU and ruin the speed numbers. If something still shows as loaded (for
+example another user of the same server), the run is kept but gets a warning row. Note that this
+unloads *all* models on the server, including the one in your chat (it reloads on your next
+message), and that every model starts cold, so *Load time* is a true cold start.
+
+| Row in the table | Meaning |
+|---|---|
+| First token / Total time | wall-clock seconds from sending the prompt (first token includes loading) |
+| Tokens/s | speed of the generation itself, from Ollama's own timing |
+| Load time, Prompt/Reply tokens, Context | as reported by Ollama |
+| Model memory | size, and how much of it sits in GPU memory (`60% GPU ⚠` = part runs on the CPU) |
+| GPU memory used / GPU peak load | peak minus baseline, sampled from `nvidia-smi` every 0.5 s; only when Ollama runs on this machine |
+| Judge score | see below |
+
+★ marks the best finished run for the speed rows and the judge score.
+
+* **Judge (optional):** pick a model in the Setup tab. After the runs it reads all answers (in
+  random order, without model names) and scores each 1-10. Treat this as a rough hint: small
+  local models are unreliable judges, and a judge that is also one of the compared models
+  tends to prefer its own style. It runs last, alone, so memory stays clean.
+* **I prefer this one:** the button under each answer records your own pick with the
+  comparison (press again to clear it).
+* **History tab:** every comparison is saved in the chat database. Select one to reopen it.
+  **Export** writes `compare-<id>.md` (prompt, metrics table, answers) to the folder you started
+  the app from; **Delete** removes it.
+* Esc stops the run (the current model stops, the rest are skipped, nothing is judged); F2 or
+  Esc goes back to the chat when nothing is running.
+
+The logic is in `ollama_compare.py`, which has no user interface and can be reused from scripts.
+
 Chats are saved automatically (after each completed reply) in a SQLite database at
 `~/.local/share/ollama_tui/chats.db` (`$XDG_DATA_HOME` is respected; override with `--db`).
 A reply you stop or that fails is shown but not saved. Esc takes effect when the next piece
