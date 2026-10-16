@@ -68,7 +68,7 @@ except ImportError:
 from ollama_client import (
     ChatSession, ConfigError, FileError, OllamaClient, build_prompt_with_files,
     config_path_from_argv, connection_defaults, default_config_path, extract_code_blocks,
-    hide_attachments, load_config, read_text_file, write_text_file,
+    hide_attachments, load_config, parse_file_args, prompt_size_problem, read_text_file, write_text_file,
 )
 # format_bytes lives in ollama_compare (which this module already depends on) so there is one copy.
 from ollama_compare import ModelRun, compare_models, comparison_markdown, format_bytes, metric_rows
@@ -1028,6 +1028,7 @@ class CompareScreen(Screen):
 
 COMMANDS = {
     "/help": "show this list",
+    "/commands": "same as /help",
     "/new": "start a new chat (keeps model, system prompt, temperature)",
     "/model [name]": "show or switch the model",
     "/pull name": "download a model",
@@ -1036,7 +1037,9 @@ COMMANDS = {
     "/system [text]": "set the system prompt (empty clears it)",
     "/temp [number]": "show or set the temperature (0-2)",
     "/rename title": "rename the current chat",
-    "/file path": "attach a text file to your next message (/file alone lists, /file clear removes)",
+    "/ctx [tokens]": "show or set the context window (default 8192; more needs more GPU memory)",
+    "/file path [filters]": "attach a text file to your next message. Filters: --grep REGEX, "
+                            "--tail N (last N lines). /file alone lists, /file clear removes",
     "/save [--code] [path]": "save the last reply (or only its code blocks) to a file",
     "/compare": "compare several models on one prompt (also F2)",
     "/quit": "exit",
@@ -1311,7 +1314,18 @@ class OllamaTui(App):
             await welcome.remove()
         # Attached files travel inside the message, so they are part of the history and the model
         # can refer back to them in later questions. They apply to this one message only.
-        text = build_prompt_with_files(text, self.attachments)
+        full_text = build_prompt_with_files(text, self.attachments)
+        if self.attachments:
+            # A file must arrive whole (Ollama would silently cut the start of an over-long
+            # prompt), so check it against the history sent with it. Give the text back.
+            problem = prompt_size_problem(
+                [m["content"] for m in self.session.messages] + [full_text], self.client.num_ctx)
+            if problem:
+                self.notify(f"Not sent: {problem} (/file clear removes the attachments.)",
+                            severity="error", timeout=12)
+                self.main_screen.query_one("#prompt", PromptArea).text = text
+                return
+        text = full_text
         self.attachments = []
         await log.mount(UserMessage(text, classes="msg user"))
         reply = AssistantMessage("…", classes="msg assistant")  # placeholder until text arrives
@@ -1446,7 +1460,7 @@ class OllamaTui(App):
         """Dispatch a slash command such as "/model llama3"."""
         name, _, arg = line.partition(" ")
         name, arg = name.lower(), arg.strip()
-        if name == "/help":
+        if name in ("/help", "/commands"):
             self.action_help()
         elif name == "/quit":
             self.exit()
@@ -1466,6 +1480,8 @@ class OllamaTui(App):
             self._apply_system(arg)
         elif name == "/temp":
             self._apply_temperature(arg)
+        elif name == "/ctx":
+            self._cmd_ctx(arg)
         elif name == "/file":
             self._cmd_file(arg)
         elif name == "/save":
@@ -1484,6 +1500,24 @@ class OllamaTui(App):
             self.notify(f"Usage: {usage}", severity="warning")
         return bool(arg)
 
+    def _cmd_ctx(self, arg: str) -> None:
+        """/ctx shows the context window; /ctx 16384 changes it for all following messages."""
+        if not arg:
+            self.notify(f"Context window: {self.client.num_ctx or 'server default'} tokens")
+            return
+        if not self._guard():
+            return
+        if not arg.isdigit() or not 512 <= int(arg) <= 1_048_576:
+            self.notify("Usage: /ctx NUMBER (512 or more, e.g. 16384)", severity="warning")
+            return
+        self.client.num_ctx = int(arg)
+        # Ollama reloads the model when the window changes, so the next reply starts slower, and
+        # a bigger window uses more GPU memory. The status bar total updates after that reply.
+        self.context_total = None
+        self._update_status()
+        self.notify(f"Context window set to {int(arg):,} tokens. The model reloads with the "
+                    "next message.")
+
     def _cmd_file(self, arg: str) -> None:
         """/file PATH queues a file for the next message; /file lists; /file clear removes all."""
         if not arg:
@@ -1495,14 +1529,17 @@ class OllamaTui(App):
             self.notify("Attachments cleared.")
         else:
             try:
-                name, text = read_text_file(arg)
+                name, text = read_text_file(*parse_file_args(arg))
+                problem = prompt_size_problem([text], self.client.num_ctx)
+                if problem:
+                    raise FileError(f"{name}: {problem}")
             except FileError as e:
-                self.notify(str(e), severity="error")
+                self.notify(str(e), severity="error", timeout=12)
                 return
             # Attaching the same file again replaces the earlier copy (e.g. after editing it).
             self.attachments = [a for a in self.attachments if a[0] != name] + [(name, text)]
             self._update_status()
-            self.notify(f"Attached {name} ({len(text.splitlines())} lines). It is sent with your "
+            self.notify(f"Attached {name} ({len(text.splitlines()):,} lines). It is sent with your "
                         "next message.")
 
     def _cmd_save(self, arg: str) -> None:
@@ -1863,6 +1900,8 @@ def build_parser(config: Optional[dict] = None) -> argparse.ArgumentParser:
                         help=f"seconds to wait for data from the server (default {d['timeout']:g})")
     parser.add_argument("--retries", type=int, default=d["retries"],
                         help=f"extra attempts after a transient error (default {d['retries']})")
+    parser.add_argument("--num-ctx", type=int, default=d["num_ctx"],
+                        help=f"context window in tokens (default {d['num_ctx']}); more needs more GPU memory")
     parser.add_argument("--db", type=Path, default=db_default,
                         help="chat database file (default: %(default)s)")
     parser.add_argument("--config", type=Path,
@@ -1877,7 +1916,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"Config error: {e}", file=sys.stderr)
         return 2
     args = build_parser(config).parse_args(argv)
-    client = OllamaClient(args.host, timeout=args.timeout, retries=args.retries)
+    client = OllamaClient(args.host, timeout=args.timeout, retries=args.retries,
+                          num_ctx=args.num_ctx)
     store = ChatStore(args.db)
     app = OllamaTui(client, store, model=args.model, system=config.get("system"),
                     temperature=float(config.get("temperature", 0.7)))

@@ -551,10 +551,163 @@ class TestCliFiles(FakeServerTestCase):
         self.assertIn("file: a.log", first)
         self.assertEqual(second, "two")
 
+    def test_grep_and_tail_options_filter_the_file(self):
+        log = self.dir / "auth.log"
+        log.write_text("\n".join(f"{i} {'bad' if i % 2 else 'ok'}" for i in range(20)) + "\n")
+        rc, _, _ = self.run_cli("ask", "x", "-f", str(log), "--grep", "bad", "--tail", "2")
+        self.assertEqual(rc, 0)
+        sent = self.chat_requests()[-1]["messages"][-1]["content"]
+        self.assertIn("auth.log (grep 'bad', last 2; 2 of 20 lines)", sent)
+        self.assertIn("17 bad\n19 bad", sent)
+        self.assertNotIn("15 bad", sent)
+
+    def test_grep_without_file_is_a_usage_error(self):
+        rc, _, err = self.run_cli("ask", "x", "--grep", "bad")
+        self.assertEqual(rc, 2)
+
+    def test_chat_file_accepts_filters(self):
+        log = self.dir / "auth.log"
+        log.write_text("a\nb bad\nc\n")
+        self.run_cli("chat", inputs=[f"/file {log} --grep bad", "go", "/exit"])
+        sent = self.chat_requests()[-1]["messages"][-1]["content"]
+        self.assertIn("b bad", sent)
+        self.assertNotIn("\nc", sent)
+
     def test_chat_save_before_any_answer(self):
         rc, out, err = self.run_cli("chat", inputs=[f"/save {self.dir / 'x'}", "/exit"])
         self.assertIn("Nothing to save", err)
         self.assertFalse((self.dir / "x").exists())
+
+
+    def big_file(self, chars=40000):
+        path = self.dir / "big.log"
+        path.write_text("a" * chars)
+        return str(path)
+
+    def test_too_big_prompt_is_refused_before_asking_the_model(self):
+        rc, _, err = self.run_cli("ask", "x", "-f", self.big_file())
+        self.assertEqual(rc, 1)
+        self.assertIn("would be sent", err)
+        self.assertEqual(self.chat_requests(), [])
+
+    def test_piped_text_is_checked_too(self):
+        rc, _, err = self.run_cli("ask", "x", stdin="a" * 40000)
+        self.assertEqual(rc, 1)
+        self.assertEqual(self.chat_requests(), [])
+
+    def test_num_ctx_option_makes_it_fit_and_is_sent(self):
+        rc, _, _ = self.run_cli("--num-ctx", "32768", "ask", "x", "-f", self.big_file())
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.chat_requests()[-1]["options"]["num_ctx"], 32768)
+
+    def test_chat_refuses_file_that_cannot_fit(self):
+        rc, out, err = self.run_cli("chat", inputs=[f"/file {self.big_file()}", "/exit"])
+        self.assertIn("would be sent", err)
+        self.assertNotIn("Attached", out)
+
+    def test_chat_refuses_file_plus_history_that_cannot_fit(self):
+        medium = self.dir / "medium.log"
+        medium.write_text("a" * 12000)  # alone ~4k tokens: fits 6,144
+        self.run_cli("chat", inputs=[f"/file {medium}", "one", f"/file {medium}", "two", "/exit"])
+        sent = [r["messages"][-1]["content"] for r in self.chat_requests()]
+        self.assertEqual(len(sent), 1)  # the second one was refused
+
+    def test_config_sets_num_ctx_default(self):
+        args = ollama_client.build_parser({"num_ctx": 4096}).parse_args(["list"])
+        self.assertEqual(args.num_ctx, 4096)
+        self.assertEqual(ollama_client.build_parser().parse_args(["list"]).num_ctx, 8192)
+
+
+
+class TestContextWindow(FakeServerTestCase):
+    """num_ctx is sent with every chat request, and over-long prompts are caught beforehand."""
+
+    def last_options(self):
+        return [b for _, b in self.server.requests if b][-1]["options"]
+
+    def test_default_window_is_8192(self):
+        self.assertEqual(self.client.num_ctx, 8192)
+        self.client.generate("hi")
+        self.assertEqual(self.last_options()["num_ctx"], 8192)
+
+    def test_every_chat_call_sends_it(self):
+        self.client.num_ctx = 16384
+        list(self.client.stream_chat([{"role": "user", "content": "hi"}]))
+        self.assertEqual(self.last_options()["num_ctx"], 16384)
+        self.client.chat_once([{"role": "user", "content": "hi"}])
+        self.assertEqual(self.last_options()["num_ctx"], 16384)
+        ChatSession(self.client).send("hi")
+        self.assertEqual(self.last_options()["num_ctx"], 16384)
+
+    def test_none_leaves_it_to_the_server(self):
+        self.client.num_ctx = None
+        self.client.generate("hi")
+        self.assertNotIn("num_ctx", self.last_options())
+
+    def test_estimate_and_size_problem(self):
+        self.assertEqual(ollama_client.estimate_tokens("x" * 300), 101)
+        self.assertIsNone(ollama_client.prompt_size_problem(["x" * 300], 8192))
+        self.assertIsNone(ollama_client.prompt_size_problem(["x" * 10**6], None))
+        message = ollama_client.prompt_size_problem(["x" * 30000, "y"], 8192)
+        self.assertIn("10,002 tokens", message)
+        self.assertIn("6,144", message)  # 75% of the window; the rest is room for the answer
+
+
+class TestFileFilters(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = Path(self.tmp.name) / "auth.log"
+        self.path.write_text("\n".join(
+            f"line {i} {'Failed password' if i % 2 == 0 else 'Accepted key'}" for i in range(10)) + "\n")
+
+    def test_grep_keeps_matching_lines_and_labels_the_excerpt(self):
+        label, text = ollama_client.read_text_file(self.path, grep="Failed")
+        self.assertEqual(text.splitlines()[0], "line 0 Failed password")
+        self.assertEqual(len(text.splitlines()), 5)
+        self.assertEqual(label, "auth.log (grep 'Failed'; 5 of 10 lines)")
+
+    def test_tail_keeps_last_lines(self):
+        label, text = ollama_client.read_text_file(self.path, tail=3)
+        self.assertEqual(text.splitlines(), ["line 7 Accepted key", "line 8 Failed password",
+                                             "line 9 Accepted key"])
+        self.assertEqual(label, "auth.log (last 3; 3 of 10 lines)")
+
+    def test_grep_then_tail(self):
+        label, text = ollama_client.read_text_file(self.path, grep="Failed", tail=2)
+        self.assertEqual(text.splitlines(), ["line 6 Failed password", "line 8 Failed password"])
+        self.assertIn("grep 'Failed', last 2; 2 of 10", label)
+
+    def test_bad_filters_are_file_errors(self):
+        for kwargs, message in [({"grep": "("}, "invalid --grep"), ({"grep": "nomatch"}, "no lines"),
+                                ({"tail": 0}, "1 or more")]:
+            with self.subTest(kwargs), self.assertRaisesRegex(ollama_client.FileError, message):
+                ollama_client.read_text_file(self.path, **kwargs)
+
+    def test_filter_allows_a_file_that_is_too_big_unfiltered(self):
+        with mock.patch.object(ollama_client, "MAX_FILE_BYTES", 100):
+            with self.assertRaisesRegex(ollama_client.FileError, "--grep / --tail"):
+                ollama_client.read_text_file(self.path)  # about 200 bytes
+            label, text = ollama_client.read_text_file(self.path, tail=2)
+            self.assertEqual(len(text.splitlines()), 2)
+
+    def test_excerpt_that_is_still_too_big_is_refused(self):
+        with mock.patch.object(ollama_client, "MAX_FILE_BYTES", 100):
+            with self.assertRaisesRegex(ollama_client.FileError, "still"):
+                ollama_client.read_text_file(self.path, tail=9)
+
+    def test_parse_file_args(self):
+        parse = ollama_client.parse_file_args
+        self.assertEqual(parse("my file.log"), ("my file.log", None, None))
+        self.assertEqual(parse("auth.log --grep 'Failed password' --tail 50"),
+                         ("auth.log", "Failed password", 50))
+        self.assertEqual(parse("--tail 5 auth.log"), ("auth.log", None, 5))
+        self.assertEqual(parse("my file.log --tail 5"), ("my file.log", None, 5))
+
+    def test_parse_file_args_errors(self):
+        for text in ("auth.log --grep", "auth.log --tail x", "--tail 5", "a --grep 'unclosed"):
+            with self.subTest(text), self.assertRaises(ollama_client.FileError):
+                ollama_client.parse_file_args(text)
 
 
 class TestFileHelpers(unittest.TestCase):

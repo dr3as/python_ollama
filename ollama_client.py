@@ -18,10 +18,11 @@ import concurrent.futures
 import json
 import os
 import re
+import shlex
 import sys
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, TypeVar, Union
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Tuple, TypeVar, Union
 
 import httpx
 import ollama
@@ -37,6 +38,11 @@ DEFAULT_EMBED_MODEL = "nomic-embed-text"
 DEFAULT_TIMEOUT = 120.0  # seconds without data from the server before a request is abandoned
 DEFAULT_RETRIES = 2
 DEFAULT_RETRY_DELAY = 1.0  # first backoff in seconds; doubles on every further retry
+# Context window in tokens. Ollama's own default is often only 4096; twice that fits a few
+# hundred lines of log. A bigger window costs GPU memory (the "KV cache" grows with it).
+DEFAULT_NUM_CTX = 8192
+CHARS_PER_TOKEN = 3  # rough: English is ~4, logs and code are ~3 or less. Low = on the safe side.
+PROMPT_BUDGET = 0.75  # share of the window a prompt may use; the rest is room for the answer
 
 # A type variable lets _with_retries say "returns whatever the wrapped call returns", so type
 # checkers and editors still know the real result type (str, a list, ...) after a retry wrapper.
@@ -87,15 +93,24 @@ class OllamaClient:
         timeout: Optional[float] = DEFAULT_TIMEOUT,
         retries: int = DEFAULT_RETRIES,
         retry_delay: float = DEFAULT_RETRY_DELAY,
+        num_ctx: Optional[int] = DEFAULT_NUM_CTX,
     ):
         """timeout is httpx's per-operation limit (e.g. waiting for the next bytes), not a cap on
         the whole request, so a long streamed answer is fine as long as data keeps arriving.
-        retries is the number of extra attempts for transient errors on non-streaming calls."""
+        retries is the number of extra attempts for transient errors on non-streaming calls.
+        num_ctx is the context window sent with every chat request (None = the server's default)."""
         self.base_url = base_url.rstrip("/")  # "http://x:11434/" and "http://x:11434" are the same
         self.default_model = default_model
         self.retries = retries
         self.retry_delay = retry_delay
+        self.num_ctx = num_ctx
         self._client = ollama.Client(host=self.base_url, timeout=timeout)
+
+    def request_options(self, **options: Any) -> Dict[str, Any]:
+        """Per-request model options (temperature, ...) plus the context window, if one is set."""
+        if self.num_ctx:
+            options["num_ctx"] = self.num_ctx
+        return options
 
     def _with_retries(self, call: Callable[[], T]) -> T:
         """Run call(), retrying transient errors with exponential backoff."""
@@ -140,7 +155,7 @@ class OllamaClient:
         max_tokens: Optional[int] = None,
     ) -> Union[str, Iterator[str]]:
         """Generate a response. Returns the full text, or an iterator of text chunks if stream=True."""
-        options: Dict[str, Any] = {"temperature": temperature}
+        options = self.request_options(temperature=temperature)
         if max_tokens is not None:
             options["num_predict"] = max_tokens  # Ollama's name for "maximum tokens to generate"
 
@@ -283,7 +298,7 @@ class OllamaClient:
             model=model or self.default_model,
             messages=messages,
             stream=True,
-            options={"temperature": temperature},
+            options=self.request_options(temperature=temperature),
         )
 
     def chat_once(self, messages: List[Dict[str, str]], model: Optional[str] = None,
@@ -292,7 +307,7 @@ class OllamaClient:
         response = self._with_retries(lambda: self._client.chat(
             model=model or self.default_model,
             messages=messages,
-            options={"temperature": temperature},
+            options=self.request_options(temperature=temperature),
             format="json" if json_format else None,
         ))
         return response.message.content or ""
@@ -388,7 +403,7 @@ class ChatSession:
                 model=self.model,
                 messages=self.messages,
                 stream=stream,
-                options={"temperature": self.temperature},
+                options=self.client.request_options(temperature=self.temperature),
             )
         except Exception:
             self.messages.pop()
@@ -442,6 +457,7 @@ CONFIG_KEYS = {
     "retries": int,
     "temperature": (int, float),
     "system": str,
+    "num_ctx": int,
     "db": str,  # chat database path (used by the TUI only); ~ is expanded
 }
 
@@ -496,12 +512,13 @@ def load_config(path: Optional[Path] = None) -> Dict[str, Any]:
 
 
 def connection_defaults(config: Dict[str, Any]) -> Dict[str, Any]:
-    """Defaults for --host, --model, --timeout and --retries (environment beats config file)."""
+    """Defaults for --host, --model, --timeout, --retries and --num-ctx (environment beats config file)."""
     return {
         "host": os.environ.get("OLLAMA_HOST") or config.get("host") or DEFAULT_HOST,
         "model": os.environ.get("OLLAMA_MODEL") or config.get("model"),
         "timeout": float(config.get("timeout", DEFAULT_TIMEOUT)),
         "retries": config.get("retries", DEFAULT_RETRIES),
+        "num_ctx": config.get("num_ctx", DEFAULT_NUM_CTX),
     }
 
 
@@ -510,22 +527,34 @@ def connection_defaults(config: Dict[str, Any]) -> Dict[str, Any]:
 # Shared by the command line (`ask --file`, `--output`) and the TUI (`/file`, `/save`).
 
 MAX_FILE_BYTES = 200_000  # roughly 50k tokens; more would not fit a typical context window anyway
+MAX_FILTERABLE_BYTES = 100_000_000  # a file may be this big if --grep / --tail cut it down first
 
 
 class FileError(ValueError):
     """A file cannot be attached or saved; the message says why and is safe to show the user."""
 
 
-def read_text_file(path: Union[str, Path]) -> Tuple[str, str]:
-    """Read a UTF-8 text file; return (file name, content). Refuses big and binary files."""
+def read_text_file(path: Union[str, Path], grep: Optional[str] = None,
+                   tail: Optional[int] = None) -> Tuple[str, str]:
+    """Read a UTF-8 text file; return (label, content). Refuses big and binary files.
+
+    grep keeps only the lines matching that regular expression, tail only the last N lines
+    (grep is applied first, like `grep PATTERN file | tail -n N`). With a filter the file itself
+    may be large (a whole auth.log); it is the filtered result that must stay small. The label is
+    the file name, plus a note about the filter so the model and the reader both know the text
+    is only an excerpt.
+    """
     path = Path(path).expanduser()
     if not path.is_file():
         raise FileError(f"not a file: {path}")
+    filtered = grep is not None or tail is not None
+    limit = MAX_FILTERABLE_BYTES if filtered else MAX_FILE_BYTES
     try:
         size = path.stat().st_size
-        if size > MAX_FILE_BYTES:
-            raise FileError(f"{path.name} is too large ({size:,} bytes, limit {MAX_FILE_BYTES:,}); "
-                            "cut out the relevant part first")
+        if size > limit:
+            hint = "cut out the relevant part first" if not filtered else "it is too large even to filter"
+            raise FileError(f"{path.name} is too large ({size:,} bytes, limit {limit:,}); {hint}"
+                            + ("" if filtered else " or use --grep / --tail"))
         data = path.read_bytes()
     except OSError as e:
         raise FileError(f"cannot read {path}: {e.strerror or e}") from e
@@ -533,9 +562,75 @@ def read_text_file(path: Union[str, Path]) -> Tuple[str, str]:
     if b"\0" in data:
         raise FileError(f"{path.name} looks like a binary file")
     try:
-        return path.name, data.decode("utf-8").rstrip("\n")
+        text = data.decode("utf-8").rstrip("\n")
     except UnicodeDecodeError:
         raise FileError(f"{path.name} is not UTF-8 text") from None
+    label = path.name
+    if filtered:
+        text, label = _filter_lines(text, path.name, grep, tail)
+        if len(text) > MAX_FILE_BYTES:
+            raise FileError(f"{label}: the excerpt is still {len(text):,} bytes (limit "
+                            f"{MAX_FILE_BYTES:,}); use a narrower --grep or a smaller --tail")
+    return label, text
+
+
+def _filter_lines(text: str, name: str, grep: Optional[str], tail: Optional[int]) -> Tuple[str, str]:
+    """Apply --grep and --tail; return (excerpt, label describing what was kept)."""
+    lines = text.split("\n")
+    total = len(lines)
+    notes = []
+    if grep is not None:
+        try:
+            pattern = re.compile(grep)
+        except re.error as e:
+            raise FileError(f"invalid --grep pattern '{grep}': {e}") from None
+        lines = [line for line in lines if pattern.search(line)]
+        notes.append(f"grep '{grep}'")
+    if tail is not None:
+        if tail < 1:
+            raise FileError("--tail needs a number of 1 or more")
+        lines = lines[-tail:]
+        notes.append(f"last {tail}")
+    if not lines:
+        raise FileError(f"no lines in {name} match grep '{grep}'")
+    return "\n".join(lines), f"{name} ({', '.join(notes)}; {len(lines):,} of {total:,} lines)"
+
+
+def parse_file_args(arg: str) -> Tuple[str, Optional[str], Optional[int]]:
+    """Split "PATH [--grep REGEX] [--tail N]" (as typed after /file) into its three parts.
+
+    Without a filter option the whole text is the path, so unquoted paths with spaces keep
+    working. With options, shell-style quoting applies: --grep "Failed password".
+    """
+    if "--grep" not in arg and "--tail" not in arg:
+        return arg, None, None
+    try:
+        tokens = shlex.split(arg)
+    except ValueError as e:  # e.g. an unclosed quote
+        raise FileError(f"cannot parse the arguments: {e}") from None
+    path_parts: List[str] = []
+    grep: Optional[str] = None
+    tail: Optional[int] = None
+    i = 0
+    while i < len(tokens):
+        token = tokens[i]
+        if token in ("--grep", "--tail"):
+            if i + 1 >= len(tokens):
+                raise FileError(f"{token} needs a value")
+            value = tokens[i + 1]
+            i += 2
+            if token == "--grep":
+                grep = value
+            elif value.isdigit():
+                tail = int(value)
+            else:
+                raise FileError("--tail needs a number")
+        else:
+            path_parts.append(token)
+            i += 1
+    if not path_parts:
+        raise FileError("give a file path first, e.g. /file auth.log --grep 'Failed password'")
+    return " ".join(path_parts), grep, tail
 
 
 # The markers must be unlikely to occur in a real file. hide_attachments() uses the same pattern
@@ -552,8 +647,11 @@ def build_prompt_with_files(prompt: str, files: List[Tuple[str, str]]) -> str:
 def hide_attachments(content: str) -> str:
     """Replace every attached file in a message by a one-line summary (for display only)."""
     def summary(m: "re.Match[str]") -> str:
+        name = m.group("name")
+        if name.endswith(" lines)"):  # a filtered file: the label already says how much was kept
+            return f"\n📎 {name}"
         lines = m.group("body").count("\n") + 1
-        return f"\n📎 {m.group('name')} ({lines} line{'s' if lines != 1 else ''})"
+        return f"\n📎 {name} ({lines} line{'s' if lines != 1 else ''})"
     return _FILE_BLOCK.sub(summary, content).strip()
 
 
@@ -563,6 +661,28 @@ def extract_code_blocks(text: str) -> str:
     if not blocks:
         raise FileError("the reply contains no code block")
     return "\n".join(b.rstrip("\n") + "\n" for b in blocks)
+
+
+def estimate_tokens(text: str) -> int:
+    """A rough token count (characters / 3). Only an estimate: each model tokenises differently."""
+    return len(text) // CHARS_PER_TOKEN + 1
+
+
+def prompt_size_problem(texts: Iterable[str], num_ctx: Optional[int]) -> Optional[str]:
+    """Return a message if these texts together would not fit the context window, else None.
+
+    Ollama does not refuse an over-long prompt: it silently drops the beginning, which for an
+    attached file means the model never sees the first part. Checking beforehand is safer.
+    """
+    if not num_ctx:
+        return None
+    needed = sum(estimate_tokens(t) for t in texts)
+    limit = int(num_ctx * PROMPT_BUDGET)
+    if needed <= limit:
+        return None
+    return (f"about {needed:,} tokens would be sent, but only {limit:,} fit in the context "
+            f"window ({num_ctx:,} tokens, minus room for the answer). Cut the input down "
+            "(e.g. grep or tail the file) or raise the window (--num-ctx / /ctx; needs more GPU memory).")
 
 
 def write_text_file(path: Union[str, Path], text: str, overwrite: bool = False) -> Path:
@@ -614,6 +734,9 @@ def _cmd_ask(client: OllamaClient, args: argparse.Namespace) -> int:
     if args.code and not args.output:
         print("--code only makes sense together with --output.", file=sys.stderr)
         return 2
+    if (args.grep is not None or args.tail is not None) and not args.file:
+        print("--grep and --tail only apply to files given with --file.", file=sys.stderr)
+        return 2
     if not parts and not args.file:
         print("Nothing to ask: give a prompt argument, --file and/or pipe text on stdin.",
               file=sys.stderr)
@@ -621,16 +744,21 @@ def _cmd_ask(client: OllamaClient, args: argparse.Namespace) -> int:
     # Fail before the (slow) model call, not after it: a bad file or an existing output file
     # would otherwise be discovered only once the answer has been generated.
     try:
-        files = [read_text_file(path) for path in args.file]
+        files = [read_text_file(path, args.grep, args.tail) for path in args.file]
         if args.output and Path(args.output).expanduser().exists() and not args.overwrite:
             raise FileError(f"{args.output} already exists (use --overwrite to replace it)")
     except FileError as e:
         print(f"Error: {e}", file=sys.stderr)
         return 1
 
+    prompt = build_prompt_with_files("\n\n".join(parts), files)
+    problem = prompt_size_problem([args.system or "", prompt], client.num_ctx)
+    if problem:
+        print(f"Error: {problem}", file=sys.stderr)
+        return 1
+
     model = _resolve_model(client, args.model)
     session = ChatSession(client, model=model, system=args.system, temperature=args.temperature)
-    prompt = build_prompt_with_files("\n\n".join(parts), files)
     if not args.output:
         for chunk in session.send(prompt, stream=True):
             print(chunk, end="", flush=True)
@@ -652,7 +780,7 @@ def _cmd_ask(client: OllamaClient, args: argparse.Namespace) -> int:
 def _cmd_chat(client: OllamaClient, args: argparse.Namespace) -> int:
     model = _resolve_model(client, args.model)
     session = ChatSession(client, model=model, system=args.system, temperature=args.temperature)
-    print(f"Chatting with {model}. Commands: /file PATH attaches a file to your next message, "
+    print(f"Chatting with {model}. Commands: /file PATH [--grep REGEX] [--tail N] attaches a file to your next message, "
           "/save PATH saves the last answer, /reset clears history, /exit quits.")
     attachments: List[Tuple[str, str]] = []
     last_reply = ""
@@ -679,7 +807,11 @@ def _cmd_chat(client: OllamaClient, args: argparse.Namespace) -> int:
                 continue
             try:
                 if command == "/file":
-                    attachments.append(read_text_file(argument))
+                    name, text = read_text_file(*parse_file_args(argument))
+                    problem = prompt_size_problem([text], client.num_ctx)
+                    if problem:
+                        raise FileError(f"{name}: {problem}")
+                    attachments.append((name, text))
                     print(f"Attached {attachments[-1][0]}; it goes with your next message.")
                 elif not last_reply:
                     print("Nothing to save yet.", file=sys.stderr)
@@ -689,9 +821,18 @@ def _cmd_chat(client: OllamaClient, args: argparse.Namespace) -> int:
             except FileError as e:
                 print(f"Error: {e}", file=sys.stderr)
             continue
+        prompt = build_prompt_with_files(message, attachments)
+        if attachments:
+            # Plain chat messages may push old history out of the window (by design); a file
+            # must arrive whole, so it is checked against everything that is sent with it.
+            problem = prompt_size_problem(
+                [m["content"] for m in session.messages] + [prompt], client.num_ctx)
+            if problem:
+                print(f"Error: {problem} Or use /reset.", file=sys.stderr)
+                continue
         try:
             chunks = []
-            for chunk in session.send(build_prompt_with_files(message, attachments), stream=True):
+            for chunk in session.send(prompt, stream=True):
                 print(chunk, end="", flush=True)
                 chunks.append(chunk)
             print()
@@ -782,6 +923,10 @@ def build_parser(config: Optional[Dict[str, Any]] = None) -> argparse.ArgumentPa
         help=f"extra attempts after a transient error (default {d['retries']})",
     )
     parser.add_argument(
+        "--num-ctx", type=int, default=d["num_ctx"],
+        help=f"context window in tokens (default {d['num_ctx']}); more needs more GPU memory",
+    )
+    parser.add_argument(
         "--config", type=Path,
         help=f"config file (default {default_config_path()})",
     )
@@ -801,6 +946,10 @@ def build_parser(config: Optional[Dict[str, Any]] = None) -> argparse.ArgumentPa
     p_ask.add_argument("prompt", nargs="?", help="the question; may be omitted if text is piped in")
     p_ask.add_argument("-f", "--file", action="append", default=[], metavar="PATH",
                        help="attach a text file to the prompt (repeatable)")
+    p_ask.add_argument("--grep", metavar="REGEX",
+                       help="with --file: keep only the lines matching this regular expression")
+    p_ask.add_argument("--tail", type=int, metavar="N",
+                       help="with --file: keep only the last N lines (after --grep)")
     p_ask.add_argument("-o", "--output", metavar="PATH",
                        help="write the answer to this file instead of printing it")
     p_ask.add_argument("--code", action="store_true",
@@ -842,7 +991,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"Config error: {e}", file=sys.stderr)
         return 2
     args = build_parser(config).parse_args(argv)
-    client = OllamaClient(args.host, timeout=args.timeout, retries=args.retries)
+    client = OllamaClient(args.host, timeout=args.timeout, retries=args.retries,
+                          num_ctx=args.num_ctx)
     # Translate expected failures into a short message and an exit code instead of a traceback.
     try:
         return args.func(client, args)

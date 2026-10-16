@@ -55,8 +55,8 @@ Text is only treated as a `/command` when it is a single line, so pasting code t
 start with `/` is sent as a message.
 
 Everything is also available as slash commands; press **Tab** to complete a command or model
-name: `/help`, `/new`, `/model [name]`, `/pull name`, `/show [name]`, `/delete name`,
-`/system [text]`, `/temp [number]`, `/rename title`, `/file path`, `/save [--code] [path]`, `/compare`, `/quit`.
+name: `/help` (or `/commands`), `/new`, `/model [name]`, `/pull name`, `/show [name]`, `/delete name`,
+`/system [text]`, `/temp [number]`, `/ctx [tokens]`, `/rename title`, `/file path`, `/save [--code] [path]`, `/compare`, `/quit`.
 Esc stops a running reply, Ctrl+N starts a new chat, Ctrl+Q quits. Replies are rendered as
 Markdown with highlighted code blocks.
 
@@ -68,11 +68,39 @@ approximate: Ollama reports only the tokens it evaluated for the request, which 
 than the whole conversation when part of it was cached. The context total is the window the
 model is actually running with, read from Ollama's `/api/ps`.
 
+### Context window and the size check
+
+Every request carries a context window (`num_ctx`), by default **8192 tokens**, twice what
+Ollama often uses on its own. Change it with `--num-ctx`, `num_ctx` in the config file or
+`/ctx 16384` in the TUI. A bigger window uses more GPU memory (the cache grows with it; on an 8 GB
+card, stay modest) and makes Ollama reload the model once when you change it. The model's own
+maximum is a hard ceiling; `show` tells you what it is.
+
+Ollama silently cuts the *start* of a prompt that is too long, so before sending a file (or
+piped text) the program estimates its size (about 3 characters per token, a safe guess for logs)
+and refuses if it would use more than 75% of the window, leaving the rest for the answer. The
+message says how many tokens it needs. Fix it by cutting the input (`grep`, `tail`) or raising the
+window. It is an estimate, so a file close to the limit may be refused although it would fit.
+
 ### Attaching files and saving replies
 
-`/file path` reads a text file (UTF-8, up to 200 KB; binary files are refused) and sends it with
+`/file path` reads a text file (UTF-8, up to 200 KB; binary files are refused; it must also fit the context window) and sends it with
 your **next** message; the status bar shows `📎 1` while a file waits. Attach several by repeating
-the command, `/file` alone lists them and `/file clear` removes them. In the chat the message
+the command, `/file` alone lists them and `/file clear` removes them.
+
+Big files, such as a whole `auth.log`, can be cut down while attaching:
+
+```
+/file /var/log/auth.log --grep "Failed password" --tail 300
+```
+
+`--grep` keeps the lines matching a regular expression (case-sensitive; start it with `(?i)` to
+ignore case), `--tail N` keeps the last N lines, and with both the grep runs first. Files up to
+100 MB can be filtered; the excerpt itself must stay under 200 KB and fit the context window. The
+attachment is labelled with what was kept (`auth.log (grep 'Failed password', last 300; 300 of
+52,104 lines)`), so the model knows it is an excerpt. Quote values that contain spaces.
+`ask` has the same as `--grep REGEX` and `--tail N` (they apply to every `--file`), and the
+`/file` command in `chat` accepts the same options as in the TUI. In the chat the message
 shows a `📎 name (N lines)` line instead of the whole file, but the model sees the full text and
 the file stays part of the saved chat, so you can ask follow-up questions about it.
 
@@ -154,6 +182,7 @@ host = "http://server:11434"   # --host
 model = "llama3"               # --model
 timeout = 120                  # --timeout, seconds
 retries = 2                    # --retries
+num_ctx = 8192                 # --num-ctx, context window in tokens
 temperature = 0.7              # default for ask/chat and the TUI's first chat
 system = "You are a security analyst."   # default system prompt
 db = "~/chats.db"              # TUI chat database (--db)

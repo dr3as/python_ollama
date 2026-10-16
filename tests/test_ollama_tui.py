@@ -1222,6 +1222,35 @@ class TestAttachments(TuiTestCase):
             await self.say(pilot, "/new")
             self.assertEqual(self.app.attachments, [])
 
+    async def test_file_filters(self):
+        log = self.dir / "auth.log"
+        log.write_text("\n".join(f"{i} {'bad' if i % 2 else 'ok'}" for i in range(20)) + "\n")
+        async with self.app.run_test(size=(120, 40)) as pilot:
+            await self.settle(pilot)
+            await self.say(pilot, f"/file {log} --grep bad --tail 2")
+            self.assertEqual(self.app.attachments[0][1], "17 bad\n19 bad")
+            await self.say(pilot, "go")
+            self.assertIn("(grep 'bad', last 2; 2 of 20 lines)", self.sent())
+            shown = str(self.app.main_screen.query(".msg.user").first().render())
+            self.assertIn("📎 auth.log (grep 'bad', last 2; 2 of 20 lines)", shown)
+            self.assertNotIn("lines) (", shown)
+
+    async def test_file_with_bad_filter_is_not_attached(self):
+        log = self.dir / "auth.log"
+        log.write_text("one\n")
+        async with self.app.run_test(size=(120, 40)) as pilot:
+            await self.settle(pilot)
+            await self.say(pilot, f"/file {log} --grep nomatch")
+            await self.say(pilot, f"/file {log} --tail abc")
+            self.assertEqual(self.app.attachments, [])
+
+    async def test_commands_is_the_same_as_help(self):
+        async with self.app.run_test(size=(120, 40)) as pilot:
+            await self.settle(pilot)
+            await self.say(pilot, "/commands")
+            self.assertIsInstance(self.app.screen, InfoScreen)
+            self.assertIn("/commands", ollama_tui.COMMAND_NAMES)
+
     async def test_save_writes_last_reply(self):
         target = self.dir / "reply.md"
         async with self.app.run_test(size=(120, 40)) as pilot:
@@ -1275,6 +1304,60 @@ class TestAttachments(TuiTestCase):
                 os.chdir(old)
             files = list(self.dir.glob("reply-*.md"))
             self.assertEqual(len(files), 1)
+
+
+class TestContextWindowTui(TuiTestCase):
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name)
+
+    async def test_ctx_command_shows_and_sets_the_window(self):
+        async with self.app.run_test(size=(120, 40)) as pilot:
+            await self.settle(pilot)
+            self.assertEqual(self.app.client.num_ctx, 8192)
+            await self.say(pilot, "/ctx 16384")
+            self.assertEqual(self.app.client.num_ctx, 16384)
+            await self.say(pilot, "hi")
+            self.assertEqual(self.server.requests[-1][1]["options"]["num_ctx"], 16384)
+
+    async def test_ctx_rejects_bad_values(self):
+        async with self.app.run_test(size=(120, 40)) as pilot:
+            await self.settle(pilot)
+            for bad in ("abc", "10", "-5"):
+                await self.say(pilot, f"/ctx {bad}")
+            await self.say(pilot, "/ctx")
+            self.assertEqual(self.app.client.num_ctx, 8192)
+
+    async def test_file_too_big_for_the_window_is_not_attached(self):
+        big = self.dir / "big.log"
+        big.write_text("a" * 40000)
+        async with self.app.run_test(size=(120, 40)) as pilot:
+            await self.settle(pilot)
+            await self.say(pilot, f"/file {big}")
+            self.assertEqual(self.app.attachments, [])
+            await self.say(pilot, "/ctx 32768")
+            await self.say(pilot, f"/file {big}")
+            self.assertEqual(len(self.app.attachments), 1)
+
+    async def test_file_plus_history_too_big_keeps_text_and_attachment(self):
+        medium = self.dir / "medium.log"
+        medium.write_text("a" * 12000)  # ~4k tokens; the budget is 6,144
+        async with self.app.run_test(size=(120, 40)) as pilot:
+            await self.settle(pilot)
+            await self.say(pilot, f"/file {medium}")
+            await self.say(pilot, "one")
+            before = len(self.server.requests)
+            await self.say(pilot, f"/file {medium}")
+            await self.say(pilot, "two")
+            self.assertEqual(len(self.server.requests), before)  # nothing was sent
+            self.assertEqual(self.app.query_one("#prompt", PromptArea).text, "two")
+            self.assertEqual(len(self.app.attachments), 1)
+
+    def test_parser_has_num_ctx(self):
+        self.assertEqual(ollama_tui.build_parser({"num_ctx": 4096}).parse_args([]).num_ctx, 4096)
+        self.assertEqual(ollama_tui.build_parser().parse_args(["--num-ctx", "2048"]).num_ctx, 2048)
 
 
 class TestTuiOffline(AsyncTestCase):
