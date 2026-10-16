@@ -7,7 +7,8 @@ How the file is organised, top to bottom:
    retries and a few convenience methods (batch_process, model management, ...).
 3. ChatSession: a conversation that remembers its history.
 4. The config file (load_config) that supplies defaults to both command lines.
-5. The command line interface: one `_cmd_*` function per sub-command, wired up in
+5. File helpers: attaching text files to a prompt and saving an answer to a file.
+6. The command line interface: one `_cmd_*` function per sub-command, wired up in
    build_parser(), and started by main().
 
 The full-screen app in ollama_tui.py builds on OllamaClient and ChatSession.
@@ -16,10 +17,11 @@ import argparse
 import concurrent.futures
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterator, List, Optional, TypeVar, Union
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, TypeVar, Union
 
 import httpx
 import ollama
@@ -503,6 +505,80 @@ def connection_defaults(config: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+# ---- attaching files and saving answers ----------------------------------------------------------
+#
+# Shared by the command line (`ask --file`, `--output`) and the TUI (`/file`, `/save`).
+
+MAX_FILE_BYTES = 200_000  # roughly 50k tokens; more would not fit a typical context window anyway
+
+
+class FileError(ValueError):
+    """A file cannot be attached or saved; the message says why and is safe to show the user."""
+
+
+def read_text_file(path: Union[str, Path]) -> Tuple[str, str]:
+    """Read a UTF-8 text file; return (file name, content). Refuses big and binary files."""
+    path = Path(path).expanduser()
+    if not path.is_file():
+        raise FileError(f"not a file: {path}")
+    try:
+        size = path.stat().st_size
+        if size > MAX_FILE_BYTES:
+            raise FileError(f"{path.name} is too large ({size:,} bytes, limit {MAX_FILE_BYTES:,}); "
+                            "cut out the relevant part first")
+        data = path.read_bytes()
+    except OSError as e:
+        raise FileError(f"cannot read {path}: {e.strerror or e}") from e
+    # A NUL byte is the classic sign of a binary file; text files never contain one.
+    if b"\0" in data:
+        raise FileError(f"{path.name} looks like a binary file")
+    try:
+        return path.name, data.decode("utf-8").rstrip("\n")
+    except UnicodeDecodeError:
+        raise FileError(f"{path.name} is not UTF-8 text") from None
+
+
+# The markers must be unlikely to occur in a real file. hide_attachments() uses the same pattern
+# to find the blocks again, so the chat view can show "📎 name" instead of the whole file.
+_FILE_BLOCK = re.compile(r"\n*----- file: (?P<name>[^\n]*) -----\n(?P<body>.*?)\n----- end of file -----", re.DOTALL)
+
+
+def build_prompt_with_files(prompt: str, files: List[Tuple[str, str]]) -> str:
+    """Append the files to the prompt, each between marker lines that include its name."""
+    blocks = [f"----- file: {name} -----\n{text}\n----- end of file -----" for name, text in files]
+    return "\n\n".join([prompt, *blocks]) if prompt else "\n\n".join(blocks)
+
+
+def hide_attachments(content: str) -> str:
+    """Replace every attached file in a message by a one-line summary (for display only)."""
+    def summary(m: "re.Match[str]") -> str:
+        lines = m.group("body").count("\n") + 1
+        return f"\n📎 {m.group('name')} ({lines} line{'s' if lines != 1 else ''})"
+    return _FILE_BLOCK.sub(summary, content).strip()
+
+
+def extract_code_blocks(text: str) -> str:
+    """The contents of all ``` fenced blocks in a reply, separated by blank lines."""
+    blocks = re.findall(r"```[^\n]*\n(.*?)```", text, re.DOTALL)
+    if not blocks:
+        raise FileError("the reply contains no code block")
+    return "\n".join(b.rstrip("\n") + "\n" for b in blocks)
+
+
+def write_text_file(path: Union[str, Path], text: str, overwrite: bool = False) -> Path:
+    """Write text to a file. Without overwrite=True an existing file is never touched."""
+    path = Path(path).expanduser()
+    try:
+        # Mode "x" fails if the file exists, which is race-free, unlike checking exists() first.
+        with open(path, "w" if overwrite else "x", encoding="utf-8") as f:
+            f.write(text if text.endswith("\n") else text + "\n")
+    except FileExistsError:
+        raise FileError(f"{path} already exists") from None
+    except OSError as e:
+        raise FileError(f"cannot write {path}: {e.strerror or e}") from e
+    return path
+
+
 # ---- command line interface ---------------------------------------------------------------------
 #
 # Each sub-command (`list`, `ask`, ...) is a function taking the client and the parsed arguments
@@ -535,22 +611,51 @@ def _cmd_ask(client: OllamaClient, args: argparse.Namespace) -> int:
         piped = sys.stdin.read().strip()
         if piped:
             parts.append(piped)
-    if not parts:
-        print("Nothing to ask: give a prompt argument and/or pipe text on stdin.", file=sys.stderr)
+    if args.code and not args.output:
+        print("--code only makes sense together with --output.", file=sys.stderr)
         return 2
+    if not parts and not args.file:
+        print("Nothing to ask: give a prompt argument, --file and/or pipe text on stdin.",
+              file=sys.stderr)
+        return 2
+    # Fail before the (slow) model call, not after it: a bad file or an existing output file
+    # would otherwise be discovered only once the answer has been generated.
+    try:
+        files = [read_text_file(path) for path in args.file]
+        if args.output and Path(args.output).expanduser().exists() and not args.overwrite:
+            raise FileError(f"{args.output} already exists (use --overwrite to replace it)")
+    except FileError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
 
     model = _resolve_model(client, args.model)
     session = ChatSession(client, model=model, system=args.system, temperature=args.temperature)
-    for chunk in session.send("\n\n".join(parts), stream=True):
-        print(chunk, end="", flush=True)
-    print()
+    prompt = build_prompt_with_files("\n\n".join(parts), files)
+    if not args.output:
+        for chunk in session.send(prompt, stream=True):
+            print(chunk, end="", flush=True)
+        print()
+        return 0
+
+    # With --output nothing is printed; the answer is collected and written to the file instead.
+    reply = "".join(session.send(prompt, stream=True))
+    try:
+        text = extract_code_blocks(reply) if args.code else reply
+        path = write_text_file(args.output, text, overwrite=args.overwrite)
+    except FileError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+    print(f"Saved {len(text):,} characters to {path}", file=sys.stderr)
     return 0
 
 
 def _cmd_chat(client: OllamaClient, args: argparse.Namespace) -> int:
     model = _resolve_model(client, args.model)
     session = ChatSession(client, model=model, system=args.system, temperature=args.temperature)
-    print(f"Chatting with {model}. Commands: /reset clears history, /exit quits.")
+    print(f"Chatting with {model}. Commands: /file PATH attaches a file to your next message, "
+          "/save PATH saves the last answer, /reset clears history, /exit quits.")
+    attachments: List[Tuple[str, str]] = []
+    last_reply = ""
     while True:
         try:
             message = input("\n> ").strip()
@@ -563,12 +668,35 @@ def _cmd_chat(client: OllamaClient, args: argparse.Namespace) -> int:
             return 0
         if message == "/reset":
             session.reset()
+            attachments.clear()
             print("History cleared.")
             continue
+        command, _, argument = message.partition(" ")
+        if command in ("/file", "/save"):
+            argument = argument.strip()
+            if not argument:
+                print(f"Usage: {command} PATH", file=sys.stderr)
+                continue
+            try:
+                if command == "/file":
+                    attachments.append(read_text_file(argument))
+                    print(f"Attached {attachments[-1][0]}; it goes with your next message.")
+                elif not last_reply:
+                    print("Nothing to save yet.", file=sys.stderr)
+                else:
+                    path = write_text_file(argument, last_reply)
+                    print(f"Saved the last answer to {path}")
+            except FileError as e:
+                print(f"Error: {e}", file=sys.stderr)
+            continue
         try:
-            for chunk in session.send(message, stream=True):
+            chunks = []
+            for chunk in session.send(build_prompt_with_files(message, attachments), stream=True):
                 print(chunk, end="", flush=True)
+                chunks.append(chunk)
             print()
+            last_reply = "".join(chunks)
+            attachments.clear()  # a file belongs to one message, like in the TUI
         except Exception as e:
             # A failed message must not end the whole chat; ChatSession already undid it.
             print(f"\nError: {e}", file=sys.stderr)
@@ -671,6 +799,14 @@ def build_parser(config: Optional[Dict[str, Any]] = None) -> argparse.ArgumentPa
 
     p_ask = sub.add_parser("ask", help="ask a single question (stdin is appended to the prompt)")
     p_ask.add_argument("prompt", nargs="?", help="the question; may be omitted if text is piped in")
+    p_ask.add_argument("-f", "--file", action="append", default=[], metavar="PATH",
+                       help="attach a text file to the prompt (repeatable)")
+    p_ask.add_argument("-o", "--output", metavar="PATH",
+                       help="write the answer to this file instead of printing it")
+    p_ask.add_argument("--code", action="store_true",
+                       help="with --output: save only the code blocks of the answer")
+    p_ask.add_argument("--overwrite", action="store_true",
+                       help="with --output: replace the file if it exists")
     add_chat_options(p_ask)
     p_ask.set_defaults(func=_cmd_ask)
 

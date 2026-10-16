@@ -66,8 +66,9 @@ except ImportError:
     psutil = None
 
 from ollama_client import (
-    ChatSession, ConfigError, OllamaClient, config_path_from_argv, connection_defaults,
-    default_config_path, load_config,
+    ChatSession, ConfigError, FileError, OllamaClient, build_prompt_with_files,
+    config_path_from_argv, connection_defaults, default_config_path, extract_code_blocks,
+    hide_attachments, load_config, read_text_file, write_text_file,
 )
 # format_bytes lives in ollama_compare (which this module already depends on) so there is one copy.
 from ollama_compare import ModelRun, compare_models, comparison_markdown, format_bytes, metric_rows
@@ -582,8 +583,9 @@ class UserMessage(Static):
 
     def __init__(self, text: str, **kwargs):
         # Text(...) from rich shows the string literally. Passing a plain str would make Textual
-        # read things like "[bold]" in a user's message as formatting markup.
-        super().__init__(Text(text), **kwargs)
+        # read things like "[bold]" in a user's message as formatting markup. Attached files are
+        # shown as a "📎 name" line; the full text (self.text) is what the model gets.
+        super().__init__(Text(hide_attachments(text)), **kwargs)
         self.text = text
 
 
@@ -1034,6 +1036,8 @@ COMMANDS = {
     "/system [text]": "set the system prompt (empty clears it)",
     "/temp [number]": "show or set the temperature (0-2)",
     "/rename title": "rename the current chat",
+    "/file path": "attach a text file to your next message (/file alone lists, /file clear removes)",
+    "/save [--code] [path]": "save the last reply (or only its code blocks) to a file",
     "/compare": "compare several models on one prompt (also F2)",
     "/quit": "exit",
 }
@@ -1112,6 +1116,7 @@ class OllamaTui(App):
         self.model_names: List[str] = []
         self.session = ChatSession(client, system=system, temperature=temperature)
         self.chat_id: Optional[int] = None  # None until the first reply is saved
+        self.attachments: List[tuple] = []  # (name, text) files waiting for the next message
         self.busy = False  # True while a reply is streaming in
         # A threading.Event is a flag that is safe to share between threads. The UI thread sets it
         # (Esc) and the streaming thread checks it between chunks.
@@ -1199,8 +1204,9 @@ class OllamaTui(App):
         system = "set" if self.session.system else "none"
         stats = format_stats(self.session.last_stats, self.context_total,
                              self.session_tokens, self._live if self.busy else None)
+        files = f" · 📎 {len(self.attachments)}" if self.attachments else ""
         self.status_text = (f"model: {self.model or '(none)'} · temp {self.session.temperature:g}"
-                            f" · system: {system} · {state}\n{stats}")
+                            f" · system: {system}{files} · {state}\n{stats}")
         self.main_screen.query_one("#status", Static).update(self.status_text)
 
     def _clear_stats(self) -> None:
@@ -1244,6 +1250,7 @@ class OllamaTui(App):
         if not self._guard():
             return
         self.chat_id = None
+        self.attachments = []
         # A fresh session keeps the current settings (system prompt, temperature) but no history.
         self.session = ChatSession(self.client, model=self.model, system=self.session.system,
                                    temperature=self.session.temperature)
@@ -1302,6 +1309,10 @@ class OllamaTui(App):
         log = self.main_screen.query_one("#log", VerticalScroll)
         for welcome in self.main_screen.query("#welcome"):
             await welcome.remove()
+        # Attached files travel inside the message, so they are part of the history and the model
+        # can refer back to them in later questions. They apply to this one message only.
+        text = build_prompt_with_files(text, self.attachments)
+        self.attachments = []
         await log.mount(UserMessage(text, classes="msg user"))
         reply = AssistantMessage("…", classes="msg assistant")  # placeholder until text arrives
         await log.mount(reply)
@@ -1407,7 +1418,7 @@ class OllamaTui(App):
         # The chat is created only now (not when it was started) so empty chats are never saved.
         if self.chat_id is None:
             self.chat_id = self.store.create_chat(
-                user_text.strip().replace("\n", " ")[:TITLE_LENGTH] or "Chat",
+                hide_attachments(user_text).replace("\n", " ")[:TITLE_LENGTH] or "Chat",
                 self.model, self.session.system, self.session.temperature,
             )
         self.store.add_messages(self.chat_id, [
@@ -1455,6 +1466,10 @@ class OllamaTui(App):
             self._apply_system(arg)
         elif name == "/temp":
             self._apply_temperature(arg)
+        elif name == "/file":
+            self._cmd_file(arg)
+        elif name == "/save":
+            self._cmd_save(arg)
         elif name == "/compare":
             self.action_compare()
         elif name == "/rename":
@@ -1468,6 +1483,60 @@ class OllamaTui(App):
         if not arg:
             self.notify(f"Usage: {usage}", severity="warning")
         return bool(arg)
+
+    def _cmd_file(self, arg: str) -> None:
+        """/file PATH queues a file for the next message; /file lists; /file clear removes all."""
+        if not arg:
+            names = ", ".join(name for name, _ in self.attachments)
+            self.notify(f"Attached: {names}" if names else "Usage: /file PATH (nothing attached yet)")
+        elif arg == "clear":
+            self.attachments = []
+            self._update_status()
+            self.notify("Attachments cleared.")
+        else:
+            try:
+                name, text = read_text_file(arg)
+            except FileError as e:
+                self.notify(str(e), severity="error")
+                return
+            # Attaching the same file again replaces the earlier copy (e.g. after editing it).
+            self.attachments = [a for a in self.attachments if a[0] != name] + [(name, text)]
+            self._update_status()
+            self.notify(f"Attached {name} ({len(text.splitlines())} lines). It is sent with your "
+                        "next message.")
+
+    def _cmd_save(self, arg: str) -> None:
+        """/save [--code] [PATH]: write the last reply (or just its code blocks) to a file."""
+        code_only = False
+        if arg == "--code" or arg.startswith("--code "):
+            code_only, arg = True, arg[len("--code"):].strip()
+        replies = [m["content"] for m in self.session.messages if m["role"] == "assistant"]
+        if not replies:
+            self.notify("There is no reply to save yet.", severity="warning")
+            return
+        try:
+            text = extract_code_blocks(replies[-1]) if code_only else replies[-1]
+        except FileError as e:
+            self.notify(str(e), severity="warning")
+            return
+        if not arg:
+            stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            arg = f"{'code' if code_only else 'reply'}-{stamp}.{'txt' if code_only else 'md'}"
+
+        def save(overwrite: bool) -> None:
+            try:
+                path = write_text_file(arg, text, overwrite=overwrite)
+            except FileError as e:
+                self.notify(str(e), severity="error")
+            else:
+                self.notify(f"Saved to {path}")
+
+        if Path(arg).expanduser().exists():
+            # Never overwrite silently: ask first, and only write if the answer is yes.
+            self.push_screen(ConfirmScreen(f"{arg} exists. Overwrite it?"),
+                             lambda yes: save(True) if yes else None)
+        else:
+            save(False)
 
     async def _cmd_model(self, arg: str) -> None:
         if not arg:
@@ -1718,6 +1787,7 @@ class OllamaTui(App):
             return
         previous_model = self.model
         self.chat_id = chat_id
+        self.attachments = []
         self.model = chat["model"] or self.model
         # Rebuild the session from the database. The stored messages are exactly what gets sent
         # to the model again with the next question.

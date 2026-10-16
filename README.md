@@ -56,7 +56,7 @@ start with `/` is sent as a message.
 
 Everything is also available as slash commands; press **Tab** to complete a command or model
 name: `/help`, `/new`, `/model [name]`, `/pull name`, `/show [name]`, `/delete name`,
-`/system [text]`, `/temp [number]`, `/rename title`, `/quit`.
+`/system [text]`, `/temp [number]`, `/rename title`, `/file path`, `/save [--code] [path]`, `/compare`, `/quit`.
 Esc stops a running reply, Ctrl+N starts a new chat, Ctrl+Q quits. Replies are rendered as
 Markdown with highlighted code blocks.
 
@@ -67,6 +67,18 @@ session. While a reply streams it shows a live token count and speed. The contex
 approximate: Ollama reports only the tokens it evaluated for the request, which can be fewer
 than the whole conversation when part of it was cached. The context total is the window the
 model is actually running with, read from Ollama's `/api/ps`.
+
+### Attaching files and saving replies
+
+`/file path` reads a text file (UTF-8, up to 200 KB; binary files are refused) and sends it with
+your **next** message; the status bar shows `📎 1` while a file waits. Attach several by repeating
+the command, `/file` alone lists them and `/file clear` removes them. In the chat the message
+shows a `📎 name (N lines)` line instead of the whole file, but the model sees the full text and
+the file stays part of the saved chat, so you can ask follow-up questions about it.
+
+`/save [path]` writes the last reply to a file (no path: `reply-<timestamp>.md` in the folder you
+started the app from). `/save --code [path]` keeps only the contents of the reply's code blocks.
+An existing file is only replaced after you confirm.
 
 ### Comparing models (F2 or `/compare`)
 
@@ -118,7 +130,9 @@ of the reply arrives, so it can lag while a model is still loading.
 python ollama_client.py list                         # installed models
 python ollama_client.py ask "What is DNS?"           # single question
 cat auth.log | python ollama_client.py ask "Summarise suspicious activity" -s "You are a security analyst"
-python ollama_client.py chat                         # interactive, keeps history (/reset, /exit)
+python ollama_client.py ask "Summarise" -f auth.log  # attach a text file (-f can be repeated)
+python ollama_client.py ask "Write a parser" -o parser.py --code   # save only the code blocks
+python ollama_client.py chat                         # interactive, keeps history (/file, /save, /reset, /exit)
 python ollama_client.py embed "some text"            # embedding vector as JSON
 python ollama_client.py pull llama3                  # download a model with progress
 python ollama_client.py show llama3                  # family, size, quantization, capabilities
@@ -150,6 +164,12 @@ Order of precedence, highest first: command-line option, environment variable (`
 the program with a `Config error` message (exit code 2) rather than being ignored. Reading the
 file needs Python 3.11+ (`tomllib`); a missing default file is fine. The TUI's Settings tab and
 `/system`, `/temp` still change values for the current chat only; they do not write the file.
+
+`ask --output PATH` writes the answer to a file instead of printing it (a one-line note goes to
+stderr), `--code` keeps only the code blocks, and an existing file is refused unless you add
+`--overwrite`. A missing or binary `--file`, or an existing output file, is reported before
+the model is asked. In `chat`, `/file PATH` attaches a file to your next message and `/save PATH`
+saves the last answer.
 
 ## Timeouts and retries
 

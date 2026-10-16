@@ -456,6 +456,160 @@ class TestCli(FakeServerTestCase):
         self.assertEqual(rc, 2)
 
 
+class TestCliFiles(FakeServerTestCase):
+    """File attachments and --output on the command line."""
+
+    run_cli = TestCli.run_cli  # reuse the helper that runs main() with captured output
+
+    def setUp(self):
+        super().setUp()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name)
+        (self.dir / "a.log").write_text("failed login root\nfailed login admin\n")
+
+    def chat_requests(self):
+        return [body for path, body in self.server.requests if path == "/api/chat"]
+
+    def test_file_is_sent_with_the_prompt(self):
+        rc, out, _ = self.run_cli("ask", "Summarise", "--file", str(self.dir / "a.log"))
+        self.assertEqual(rc, 0)
+        sent = self.chat_requests()[-1]["messages"][-1]["content"]
+        self.assertTrue(sent.startswith("Summarise\n\n----- file: a.log -----\nfailed login root"))
+
+    def test_file_without_prompt_is_enough(self):
+        rc, _, _ = self.run_cli("ask", "-f", str(self.dir / "a.log"))
+        self.assertEqual(rc, 0)
+
+    def test_several_files(self):
+        (self.dir / "b.txt").write_text("second")
+        self.run_cli("ask", "x", "-f", str(self.dir / "a.log"), "-f", str(self.dir / "b.txt"))
+        sent = self.chat_requests()[-1]["messages"][-1]["content"]
+        self.assertIn("file: a.log", sent)
+        self.assertIn("file: b.txt", sent)
+
+    def test_bad_file_stops_before_asking_the_model(self):
+        rc, _, err = self.run_cli("ask", "x", "-f", str(self.dir / "missing"))
+        self.assertEqual(rc, 1)
+        self.assertIn("not a file", err)
+        self.assertEqual(self.chat_requests(), [])
+
+    def test_output_writes_file_and_prints_no_answer(self):
+        target = self.dir / "answer.md"
+        rc, out, err = self.run_cli("ask", "hello", "-o", str(target))
+        self.assertEqual(rc, 0)
+        self.assertEqual(out, "")
+        self.assertIn("Saved", err)
+        self.assertEqual(target.read_text(), "msgs=1 last=hello\n")
+
+    def test_output_refuses_existing_file_before_asking(self):
+        target = self.dir / "answer.md"
+        target.write_text("precious")
+        rc, _, err = self.run_cli("ask", "hello", "-o", str(target))
+        self.assertEqual(rc, 1)
+        self.assertIn("--overwrite", err)
+        self.assertEqual(target.read_text(), "precious")
+        self.assertEqual(self.chat_requests(), [])
+
+    def test_overwrite_replaces_file(self):
+        target = self.dir / "answer.md"
+        target.write_text("old")
+        rc, _, _ = self.run_cli("ask", "hello", "-o", str(target), "--overwrite")
+        self.assertEqual(rc, 0)
+        self.assertEqual(target.read_text(), "msgs=1 last=hello\n")
+
+    def test_code_saves_only_code_blocks(self):
+        # The fake echoes the last message, so the prompt itself carries the fenced block.
+        target = self.dir / "code.py"
+        rc, _, _ = self.run_cli("ask", "```\nprint(1)\n```", "-o", str(target), "--code")
+        self.assertEqual(rc, 0)
+        self.assertEqual(target.read_text(), "print(1)\n")
+
+    def test_code_without_a_code_block_writes_nothing(self):
+        target = self.dir / "code.py"
+        rc, _, err = self.run_cli("ask", "hello", "-o", str(target), "--code")
+        self.assertEqual(rc, 1)
+        self.assertIn("no code block", err)
+        self.assertFalse(target.exists())
+
+    def test_code_needs_output(self):
+        rc, _, err = self.run_cli("ask", "hello", "--code")
+        self.assertEqual(rc, 2)
+
+    def test_chat_file_and_save_commands(self):
+        target = self.dir / "saved.md"
+        rc, out, err = self.run_cli(
+            "chat", inputs=[f"/file {self.dir / 'a.log'}", "check this", f"/save {target}", "/exit"])
+        self.assertEqual(rc, 0)
+        self.assertIn("Attached a.log", out)
+        self.assertIn("failed login root", self.chat_requests()[-1]["messages"][-1]["content"])
+        self.assertIn("msgs=1 last=", target.read_text())
+
+    def test_chat_attachment_applies_to_one_message_only(self):
+        self.run_cli("chat", inputs=[f"/file {self.dir / 'a.log'}", "one", "two", "/exit"])
+        first, second = [r["messages"][-1]["content"] for r in self.chat_requests()]
+        self.assertIn("file: a.log", first)
+        self.assertEqual(second, "two")
+
+    def test_chat_save_before_any_answer(self):
+        rc, out, err = self.run_cli("chat", inputs=[f"/save {self.dir / 'x'}", "/exit"])
+        self.assertIn("Nothing to save", err)
+        self.assertFalse((self.dir / "x").exists())
+
+
+class TestFileHelpers(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name)
+
+    def test_read_text_file(self):
+        (self.dir / "a.log").write_text("line1\nline2\n")
+        self.assertEqual(ollama_client.read_text_file(self.dir / "a.log"), ("a.log", "line1\nline2"))
+
+    def test_read_refuses_missing_big_binary_and_non_utf8(self):
+        (self.dir / "bin").write_bytes(b"ab\0cd")
+        (self.dir / "latin").write_bytes("blåbær".encode("latin-1"))
+        (self.dir / "big").write_text("x" * 50)
+        with mock.patch.object(ollama_client, "MAX_FILE_BYTES", 10):
+            for name, message in [("nope", "not a file"), ("bin", "binary"),
+                                  ("latin", "not UTF-8"), ("big", "too large")]:
+                with self.subTest(name), self.assertRaisesRegex(ollama_client.FileError, message):
+                    ollama_client.read_text_file(self.dir / name)
+
+    def test_build_and_hide_roundtrip(self):
+        prompt = ollama_client.build_prompt_with_files(
+            "Summarise", [("a.log", "x\ny"), ("b.txt", "z")])
+        self.assertIn("----- file: a.log -----\nx\ny\n----- end of file -----", prompt)
+        self.assertEqual(ollama_client.hide_attachments(prompt),
+                         "Summarise\n📎 a.log (2 lines)\n📎 b.txt (1 line)")
+
+    def test_prompt_without_text_and_message_without_files(self):
+        self.assertEqual(ollama_client.build_prompt_with_files("hi", []), "hi")
+        self.assertTrue(ollama_client.build_prompt_with_files("", [("a", "b")]).startswith("-----"))
+        self.assertEqual(ollama_client.hide_attachments("plain"), "plain")
+
+    def test_extract_code_blocks(self):
+        reply = "Intro\n```python\nprint(1)\n```\ntext\n```\nls\n```\n"
+        self.assertEqual(ollama_client.extract_code_blocks(reply), "print(1)\n\nls\n")
+        with self.assertRaises(ollama_client.FileError):
+            ollama_client.extract_code_blocks("no code here")
+
+    def test_write_text_file_never_overwrites_by_default(self):
+        path = self.dir / "out.txt"
+        ollama_client.write_text_file(path, "one")
+        self.assertEqual(path.read_text(), "one\n")
+        with self.assertRaisesRegex(ollama_client.FileError, "already exists"):
+            ollama_client.write_text_file(path, "two")
+        self.assertEqual(path.read_text(), "one\n")
+        ollama_client.write_text_file(path, "two", overwrite=True)
+        self.assertEqual(path.read_text(), "two\n")
+
+    def test_write_to_missing_folder_is_a_file_error(self):
+        with self.assertRaises(ollama_client.FileError):
+            ollama_client.write_text_file(self.dir / "no" / "dir.txt", "x")
+
+
 class TestConfigFile(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

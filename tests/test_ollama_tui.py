@@ -7,6 +7,7 @@ Three kinds of test live here:
 * regression tests for bugs we fixed (look for "dialog" in the test names).
 """
 import asyncio
+import os
 import subprocess
 import tempfile
 import unittest
@@ -1144,6 +1145,136 @@ class TestConfigDefaults(unittest.TestCase):
                 rc = ollama_tui.main(["--config", str(path)])
         self.assertEqual(rc, 2)
         self.assertIn("Config error", "".join(c.args[0] for c in err.write.call_args_list))
+
+
+class TestAttachments(TuiTestCase):
+    """/file attaches a text file to the next message; /save writes a reply to a file."""
+
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name)
+        (self.dir / "a.log").write_text("failed login root\nfailed login admin\n")
+
+    def sent(self):
+        """The content of the last user message the fake server received."""
+        return [b for p, b in self.server.requests if p == "/api/chat"][-1]["messages"][-1]["content"]
+
+    async def test_file_goes_with_the_next_message_only(self):
+        async with self.app.run_test(size=(120, 40)) as pilot:
+            await self.settle(pilot)
+            await self.say(pilot, f"/file {self.dir / 'a.log'}")
+            self.assertEqual([a[0] for a in self.app.attachments], ["a.log"])
+            self.assertIn("📎 1", self.app.status_text)
+            await self.say(pilot, "Summarise")
+            self.assertIn("----- file: a.log -----\nfailed login root", self.sent())
+            self.assertEqual(self.app.attachments, [])
+            self.assertNotIn("📎", self.app.status_text)
+            await self.say(pilot, "and now?")
+            self.assertEqual(self.sent(), "and now?")
+
+    async def test_chat_shows_a_summary_not_the_file(self):
+        async with self.app.run_test(size=(120, 40)) as pilot:
+            await self.settle(pilot)
+            await self.say(pilot, f"/file {self.dir / 'a.log'}")
+            await self.say(pilot, "Summarise")
+            shown = str(self.app.main_screen.query(".msg.user").first().render())
+            self.assertEqual(shown, "Summarise\n📎 a.log (2 lines)")
+            self.assertEqual(self.store.get_chat(self.app.chat_id)["title"],
+                             "Summarise 📎 a.log (2 lines)")
+
+    async def test_reloaded_chat_shows_summary_and_keeps_file_in_history(self):
+        async with self.app.run_test(size=(120, 40)) as pilot:
+            await self.settle(pilot)
+            await self.say(pilot, f"/file {self.dir / 'a.log'}")
+            await self.say(pilot, "Summarise")
+            chat_id = self.app.chat_id
+            await self.say(pilot, "/new")
+            await self.app._load_chat(chat_id)
+            await self.settle(pilot)
+            shown = str(self.app.main_screen.query(".msg.user").first().render())
+            self.assertIn("📎 a.log", shown)
+            self.assertNotIn("failed login", shown)
+            self.assertIn("failed login root", self.app.session.messages[0]["content"])
+
+    async def test_attaching_same_file_twice_keeps_one_copy(self):
+        async with self.app.run_test(size=(120, 40)) as pilot:
+            await self.settle(pilot)
+            await self.say(pilot, f"/file {self.dir / 'a.log'}")
+            (self.dir / "a.log").write_text("changed")
+            await self.say(pilot, f"/file {self.dir / 'a.log'}")
+            self.assertEqual(self.app.attachments, [("a.log", "changed")])
+
+    async def test_file_clear_and_bad_file(self):
+        async with self.app.run_test(size=(120, 40)) as pilot:
+            await self.settle(pilot)
+            await self.say(pilot, f"/file {self.dir / 'a.log'}")
+            await self.say(pilot, "/file clear")
+            self.assertEqual(self.app.attachments, [])
+            await self.say(pilot, f"/file {self.dir / 'missing'}")
+            self.assertEqual(self.app.attachments, [])
+
+    async def test_new_chat_drops_attachments(self):
+        async with self.app.run_test(size=(120, 40)) as pilot:
+            await self.settle(pilot)
+            await self.say(pilot, f"/file {self.dir / 'a.log'}")
+            await self.say(pilot, "/new")
+            self.assertEqual(self.app.attachments, [])
+
+    async def test_save_writes_last_reply(self):
+        target = self.dir / "reply.md"
+        async with self.app.run_test(size=(120, 40)) as pilot:
+            await self.settle(pilot)
+            await self.say(pilot, "hello")
+            await self.say(pilot, f"/save {target}")
+            self.assertEqual(target.read_text(), "msgs=1 last=hello\n")
+
+    async def test_save_code_writes_only_code_blocks(self):
+        target = self.dir / "code.py"
+        async with self.app.run_test(size=(120, 40)) as pilot:
+            await self.settle(pilot)
+            await self.say(pilot, "```\nprint(1)\n```")  # the fake echoes this back
+            await self.say(pilot, f"/save --code {target}")
+            self.assertEqual(target.read_text(), "print(1)\n")
+
+    async def test_save_without_reply_or_without_code_writes_nothing(self):
+        target = self.dir / "x.txt"
+        async with self.app.run_test(size=(120, 40)) as pilot:
+            await self.settle(pilot)
+            await self.say(pilot, f"/save {target}")
+            await self.say(pilot, "hello")
+            await self.say(pilot, f"/save --code {target}")
+            self.assertFalse(target.exists())
+
+    async def test_save_asks_before_overwriting(self):
+        target = self.dir / "reply.md"
+        target.write_text("precious")
+        async with self.app.run_test(size=(120, 40)) as pilot:
+            await self.settle(pilot)
+            await self.say(pilot, "hello")
+            await self.say(pilot, f"/save {target}")
+            self.assertIsInstance(self.app.screen, ConfirmScreen)
+            await pilot.press("n")
+            await pilot.pause()
+            self.assertEqual(target.read_text(), "precious")
+            await self.say(pilot, f"/save {target}")
+            await pilot.press("y")
+            await pilot.pause()
+            self.assertEqual(target.read_text(), "msgs=1 last=hello\n")
+
+    async def test_save_without_path_uses_a_timestamped_name_in_cwd(self):
+        async with self.app.run_test(size=(120, 40)) as pilot:
+            await self.settle(pilot)
+            await self.say(pilot, "hello")
+            old = Path.cwd()
+            os.chdir(self.dir)
+            try:
+                await self.say(pilot, "/save")
+            finally:
+                os.chdir(old)
+            files = list(self.dir.glob("reply-*.md"))
+            self.assertEqual(len(files), 1)
 
 
 class TestTuiOffline(AsyncTestCase):
