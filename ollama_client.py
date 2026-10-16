@@ -5,6 +5,7 @@ import os
 import sys
 from typing import Any, Dict, Iterator, List, Optional, Union
 
+import httpx
 import ollama
 
 DEFAULT_HOST = "http://localhost:11434"
@@ -333,7 +334,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     except ollama.ResponseError as e:
         print(f"Ollama error: {e}", file=sys.stderr)
         return 1
-    except ConnectionError as e:
+    except (ConnectionError, httpx.TransportError) as e:
         print(f"Cannot reach Ollama at {client.base_url}: {e}", file=sys.stderr)
         return 1
 

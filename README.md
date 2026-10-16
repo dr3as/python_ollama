@@ -27,3 +27,12 @@ session = ChatSession(client, model="llama3", system="Be brief.")
 print(session.send("Hi, I'm Andreas."))
 print(session.send("What's my name?"))   # remembers the previous turn
 ```
+
+## Tests
+
+```bash
+python -m unittest
+```
+
+Uses only the standard library. The tests run against a small fake Ollama server
+(`tests/fake_ollama.py`), so no real Ollama or model is needed.
